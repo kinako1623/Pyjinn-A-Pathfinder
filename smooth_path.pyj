@@ -24,6 +24,11 @@ stuck_ticks = 0
 last_waypoint_dist = 999999.0
 path = None
 
+FINAL_WAYPOINT_THRESHOLD = 1.2
+NORMAL_WAYPOINT_THRESHOLD = 1.8
+
+WAYPOINT_OVERSHOOT_THRESHOLD = 0.2
+
 class MinHeap:
     def __init__(self):
         self.heap = []
@@ -138,7 +143,6 @@ def is_passable(block_id: str) -> bool:
     if not block_id: return True
     b = block_id.lower()
     b = b.split("[")[0]
-    echo(b)
     return b in AIRLIKE or b in IGNORE_BLOCKS or is_bottom_slab(b)
 
 def is_supportive(block_id: str) -> bool:
@@ -500,10 +504,6 @@ def path_find(start, goal, do_smooth=True):
                 tie_breaker += 1
                 pq.push(neighbor.F(), neighbor.H, tie_breaker, neighbor)
 
-        
-            thread = JavaClass("java.lang.Thread")
-            thread.sleep(1)
-        
 
     raise ValueError("No path found")
 
@@ -784,7 +784,9 @@ def on_render(e):
             return
 
     waypoint_threshold = (
-        0.8 if is_final_waypoint else 1.0
+        FINAL_WAYPOINT_THRESHOLD
+        if is_final_waypoint
+        else NORMAL_WAYPOINT_THRESHOLD
     )
 
     if dist < waypoint_threshold:
@@ -798,7 +800,7 @@ def on_render(e):
 
     if (
         not is_final_waypoint
-        and dist > last_waypoint_dist + 0.8
+        and dist > last_waypoint_dist + WAYPOINT_OVERSHOOT_THRESHOLD
     ):
         current_index += 1
         last_waypoint_dist = 999999.0
@@ -830,13 +832,11 @@ def on_render(e):
         jump(False)
 
     if speed < 0.03:
+        echo(stuck_ticks)
         stuck_ticks += 1
     else:
         stuck_ticks = 0
 
-    if stuck_ticks > 35 and jump_cooldown <= 0:
-        jump(True)
+    if stuck_ticks > 35:
+        jump(True) 
         jump_cooldown = 3
-    else:
-        if jump_cooldown > 1:
-            jump(False)
