@@ -4,12 +4,15 @@ from system.pyj.minescript import *
 Minecraft = JavaClass("net.minecraft.client.Minecraft")
 Math = JavaClass("java.lang.Math")
 System = JavaClass("java.lang.System")
+path_executor = JavaClass("java.util.concurrent.Executors").newSingleThreadExecutor()
+Thread = JavaClass("java.lang.Thread")
 
 mc = Minecraft.getInstance()
 current_path = None
 current_index = 1
 listener_id2 = None
 move_status = "idle"
+async_next_path = None
 
 rotation_state = {
     "last_yaw": 0.0,
@@ -23,22 +26,13 @@ jump_cooldown = 0
 stuck_ticks = 0
 last_waypoint_dist = 999999.0
 path = None
-
-LOS_CALLS = 0
-BLOCK_READS = 0
-NODES_EXPANDED = 0
-WALKABLE_CALLS = 0
-SUPPORT_CALLS = 0
-CLEARANCE_CALLS = 0
-DIAGONAL_CALLS = 0
+debug_timer = 0
+path_future = None
 
 FINAL_WAYPOINT_THRESHOLD = 1.2
 NORMAL_WAYPOINT_THRESHOLD = 1.8
-
 WAYPOINT_OVERSHOOT_THRESHOLD = 0.2
 
-diag_fail = 0
-diag_call = 0
 
 class MinHeap:
     def __init__(self):
@@ -135,7 +129,7 @@ MAX_VERTICAL_STEP = 1
 EYE_HEIGHT = 1.62
 BODY_RADIUS = 0.8
 BODY_SAMPLE_LEVELS = (0.2, 0.9, 1.5)
-ENTITY_HEIGHT = 1.9
+ENTITY_HEIGHT = 2.1
 LOS_EYE_OFFSETS = ((-0.25, -0.25), (-0.25, 0.25), (0.25, -0.25), (0.25, 0.25), (0.0, 0.0))
 LOS_BODY_OFFSETS = ((-BODY_RADIUS, -BODY_RADIUS), (-BODY_RADIUS, BODY_RADIUS), (BODY_RADIUS, -BODY_RADIUS), (BODY_RADIUS, BODY_RADIUS), (0.0, 0.0))
 
@@ -144,6 +138,11 @@ COST_DIAGONAL = Math.sqrt(2.0)
 COST_STEP_CARD = Math.sqrt(2.0)
 COST_STEP_DIAG = Math.sqrt(3.0)
 HEURISTIC_WEIGHT = 1.3
+
+segment_queue = []
+segment_end_node = None
+MAX_SEGMENT_EXPANSIONS = 15000
+last_requested_start = None
 
 def is_bottom_slab(b: str) -> bool:
     return ("slab" in b) and ("double" not in b) and (
@@ -158,19 +157,14 @@ def is_passable(block_id: str) -> bool:
 
 def is_supportive(block_id: str) -> bool:
     if not block_id: return False
-    global SUPPORT_CALLS
-    SUPPORT_CALLS += 1
     b = block_id.lower()
     b = b.split("[")[0]
     if b in LIQUIDS or b in AIRLIKE or b in IGNORE_BLOCKS: return False
     return True
 
 def get_block_cached(x, y, z, cache):
-    global BLOCK_READS
     key = (x, y, z)
     if key not in cache:
-        
-        BLOCK_READS += 1
         cache[key] = getblock(x, y, z)
     return cache[key]
 
@@ -212,13 +206,9 @@ def has_clearance_cached(x, y, z, cache):
     return cache[key]
 
 def has_clearance(x, y, z, cache) -> bool:
-    global CLEARANCE_CALLS
-    CLEARANCE_CALLS += 1
     return is_passable(get_block_cached(x, y, z, cache)) and is_passable(get_block_cached(x, y + 1, z, cache))
 
 def LOS(start, end, cache) -> bool:
-    global LOS_CALLS
-    LOS_CALLS += 1
     x0, y0, z0 = start
     x1, y1, z1 = end
 
@@ -360,22 +350,16 @@ class Node:
             return Math.sqrt(dx * dx + dy * dy + dz * dz)
 
     def _diagonal_clearance_ok(self, cx, cy, cz, nx, ny, nz, cache) -> bool:
-        global DIAGONAL_CALLS
-        global diag_fail
-        DIAGONAL_CALLS += 1
         dx, dz = nx - cx, nz - cz
         if int(Math.abs(dx)) == 1 and int(Math.abs(dz)) == 1:
             base_y = int(Math.min(cy, ny))
             if (ny - cy) > 0:
                 if not has_clearance(cx, base_y, cz + dz, cache): 
-                    diag_fail += 1
                     return False
             else:
                 if not has_clearance(cx + dx, base_y, cz, cache): 
-                    diag_fail += 1
                     return False
                 if not has_clearance(cx, base_y, cz + dz, cache): 
-                    diag_fail += 1
                     return False
         return True
 
@@ -387,8 +371,6 @@ class Node:
         if key in cache:
             return cache[key]
 
-        global WALKABLE_CALLS
-        WALKABLE_CALLS += 1
         dy = ny - cy
 
         if int(Math.abs(dy)) > MAX_VERTICAL_STEP:
@@ -524,7 +506,6 @@ def get_full_route(path):
     return unique_route
 
 def path_find(start, goal, do_smooth=True):
-    global NODES_EXPANDED
     start_time = System.currentTimeMillis()
     
     start = (int(Math.floor(start[0])), int(Math.floor(start[1])), int(Math.floor(start[2])))
@@ -532,11 +513,13 @@ def path_find(start, goal, do_smooth=True):
 
     cache = {}
     start_node = Node(start)
+    start_node.G = 0 
     start_node.H = start_node.heuristic(goal)
 
     pq = MinHeap()
     tie_breaker = 0
-    pq.push(start_node.F, start_node.H, tie_breaker, start_node)
+    
+    pq.push(start_node.F(), start_node.H, tie_breaker, start_node)
 
     closed = set()
     node_map = {start: start_node}
@@ -544,7 +527,6 @@ def path_find(start, goal, do_smooth=True):
     while not pq.is_empty():
 
         current = pq.pop()
-        NODES_EXPANDED += 1
         if current.pos in closed: continue
         if current.G > node_map[current.pos].G:
             continue
@@ -577,49 +559,37 @@ def path_find(start, goal, do_smooth=True):
                 tie_breaker += 1
                 pq.push(neighbor.F(), neighbor.H, tie_breaker, neighbor)
 
-
     raise ValueError("No path found")
 
+def start_async_pathfind(start, goal):
+    global path_future
+    def task():
+        echo("PATH THREAD START")
+        try:
+            result = path_find(start, goal)
+            return result
+        except Exception as e:
+            echo(f"Error in pathfinding thread: {e}")
+            raise e
+            
+    path_future = path_executor.submit(task)
+    
 def goto(x, y, z):
     global current_path
     global current_index
     global listener_id2
     global move_status
     global path
-    global NODES_EXPANDED
-    global WALKABLE_CALLS
-    global diag_fail
 
     current_path = None
-    current_index = 1
-    listener_id2 = None
-    move_status = "idle"
+    current_index = 0
 
     start = player_position()
     goal = (x, y, z)
-    
-    try:
-        path = path_find(start, goal)
-    except Exception as e:
-        echo(f"Error: {e}")
-        return
 
-    if not path:
-        echo("No path found.")
-        return
-    
-    current_index = 0
-    move_status = "running"
-    current_path = path
+    move_status = "searching"
 
-    # echo(f"LOS={LOS_CALLS}")
-    # echo(f"Blocks={BLOCK_READS}")
-    # echo(f"Nodes={NODES_EXPANDED}")
-    # echo(f"WALKABLE={WALKABLE_CALLS}")
-    # echo(f"SUPPORT={SUPPORT_CALLS}")
-    # echo(f"CLEARANCE={CLEARANCE_CALLS}")
-    # echo(f"DIAGONAL={DIAGONAL_CALLS}")
-    # echo(f"DIAGONAL fail={diag_fail}")
+    start_async_pathfind(start, goal)
 
     if listener_id2 is None:
         listener_id2 = add_event_listener(
@@ -811,6 +781,27 @@ def on_render(e):
     global stuck_ticks
     global jump_cooldown
     global last_waypoint_dist
+    global debug_timer
+
+    if move_status == "searching":
+        debug_timer += 1
+        if debug_timer >= 20:
+            debug_timer = 0
+            echo("MAIN THREAD ALIVE")
+
+        if path_future is not None and path_future.isDone():
+
+            try:
+                current_path = path_future.get()
+                current_index = 0
+                move_status = "running"
+                echo("PATH RECEIVED")
+
+            except Exception as ex:
+                echo(str(ex))
+                move_status = "idle"
+
+        return
 
     if current_path is None:
         return
