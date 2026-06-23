@@ -587,6 +587,20 @@ def goto(x, y, z):
     global listener_id2
     global move_status
     global path
+    global current_path
+    global async_next_path
+    global jump_cooldown
+    global last_waypoint_dist
+    global path_future
+
+    listener_id2 = None
+    move_status = "idle"
+    async_next_path = None
+
+    jump_cooldown = 0
+    last_waypoint_dist = 999999.0
+    path = None
+    path_future = None
 
     current_path = None
     current_index = 0
