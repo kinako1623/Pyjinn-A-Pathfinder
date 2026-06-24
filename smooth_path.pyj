@@ -567,19 +567,6 @@ def path_find(start, goal, do_smooth=True):
                 pq.push(neighbor.F(), neighbor.H, tie_breaker, neighbor)
 
     raise ValueError("No path found")
-
-def start_async_pathfind(start, goal):
-    global path_future
-    def task():
-        echo("PATH THREAD START")
-        try:
-            result = path_find(start, goal)
-            return result
-        except Exception as e:
-            echo(f"Error in pathfinding thread: {e}")
-            raise e
-            
-    path_future = path_executor.submit(task)
     
 def goto(x, y, z):
     global current_path
@@ -610,7 +597,16 @@ def goto(x, y, z):
 
     move_status = "searching"
 
-    start_async_pathfind(start, goal)
+    def task():
+        echo("PATH THREAD START")
+        try:
+            result = path_find(start, goal)
+            return result
+        except Exception as e:
+            echo(f"Error in pathfinding thread: {e}")
+            raise e
+            
+    path_future = path_executor.submit(task)
 
     if listener_id2 is None:
         listener_id2 = add_event_listener(
@@ -618,7 +614,7 @@ def goto(x, y, z):
             on_render
         )
 
-    return path
+    return path_future
 
 def normalize_angle(angle):
     return (angle + 180.0) % 360.0 - 180.0
@@ -917,9 +913,9 @@ def on_render(e):
 
     should_normal_jump = False
 
-    if dy > 0.6 and dist < 1.6:
+    if dy > 0.6 and dist < 2.2:
         should_normal_jump = True
-    elif dy > 1.2 and dist < 2.2:
+    elif dy > 1.2 and dist < 3:
         should_normal_jump = True
 
     if should_normal_jump and jump_cooldown <= 0:
