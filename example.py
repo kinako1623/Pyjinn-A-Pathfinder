@@ -1,7 +1,7 @@
 from system.lib import minescript
 import java, ast, time, math
 
-pathfinder = java.import_pyjinn_script("mining/smooth_path.pyj")
+pathfinder = java.import_pyjinn_script("smooth_path.pyj")
 
 path = pathfinder.get("goto")(-22, 71, -375).get()
 
