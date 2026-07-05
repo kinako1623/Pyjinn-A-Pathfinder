@@ -3,7 +3,7 @@ import java, ast, time, math
 
 pathfinder = java.import_pyjinn_script("smooth_path.pyj")
 
-path = pathfinder.get("goto")(-22, 71, -375).get()
+path = pathfinder.get("goto")(-2, 71, -350)
 
 minescript.echo(path)
 raw_route_str = str(path)
@@ -21,3 +21,7 @@ while True:
             print("exit 1")
             break
         time.sleep(0.1)
+
+time.sleep(4)
+for x, y, z in new_route:
+    minescript.execute(f"setblock {x} {y - 1} {z} minecraft:stone")
