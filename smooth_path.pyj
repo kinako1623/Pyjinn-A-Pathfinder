@@ -3,13 +3,23 @@ from system.pyj.minescript import *
 
 Minecraft = JavaClass("net.minecraft.client.Minecraft")
 Math = JavaClass("java.lang.Math")
+Queue = JavaClass("java.util.PriorityQueue")
 System = JavaClass("java.lang.System")
 path_executor = JavaClass("java.util.concurrent.Executors").newSingleThreadExecutor()
 Thread = JavaClass("java.lang.Thread")
+HashSet = JavaClass("java.util.HashSet")
+
 Gizmos          = JavaClass("net.minecraft.gizmos.Gizmos")
 GizmoStyle      = JavaClass("net.minecraft.gizmos.GizmoStyle")
-TextGizmo_Style = JavaClass("net.minecraft.gizmos.TextGizmo$Style")
+
+Blocks = JavaClass("net.minecraft.world.level.block.Blocks")
+BlockState = JavaClass("net.minecraft.world.level.block.state.BlockState")
+BuiltInRegistries = JavaClass("net.minecraft.core.registries.BuiltInRegistries")
+SlabBlock = JavaClass("net.minecraft.world.level.block.SlabBlock")
+SlabType = JavaClass("net.minecraft.world.level.block.state.properties.SlabType")
+MutableBlockPos = JavaClass("net.minecraft.core.BlockPos$MutableBlockPos")
 BlockPos        = JavaClass("net.minecraft.core.BlockPos")
+
 Vec3            = JavaClass("net.minecraft.world.phys.Vec3")
 AABB            = JavaClass("net.minecraft.world.phys.AABB")
 LineGizmo = JavaClass("net.minecraft.gizmos.LineGizmo")
@@ -30,13 +40,8 @@ listener_id2 = None
 move_status = "idle"
 async_next_path = None
 
-rotation_state = {
-    "last_yaw": 0.0,
-    "last_pitch": 0.0,
-    "target_yaw": 0.0,
-    "target_pitch": 0.0,
-    "frames_to_target": 0,
-}
+level = mc.level
+mutable_pos = MutableBlockPos()
 
 jump_cooldown = 0
 stuck_ticks = 0
@@ -49,104 +54,32 @@ FINAL_WAYPOINT_THRESHOLD = 1.2
 NORMAL_WAYPOINT_THRESHOLD = 1.4
 WAYPOINT_OVERSHOOT_THRESHOLD = 0.2
 
+def create_set_from_blocks(block_list):
+    h_set = HashSet()
+    for block in block_list:
+        h_set.add(block)
+    return h_set
 
-class MinHeap:
-    def __init__(self):
-        self.heap = []
-        self.f_scores = []
-        self.h_scores = []
-        self.ties = []
+# 2. 文字列を使わず、Blocksクラスのフィールドを直接指定
+AIRLIKE = create_set_from_blocks([Blocks.AIR, Blocks.LIGHT])
+LIQUIDS = create_set_from_blocks([Blocks.WATER, Blocks.LAVA])
+IGNORE_BLOCKS = create_set_from_blocks([
+    Blocks.AIR, 
+    Blocks.OAK_SIGN, 
+    Blocks.POPPY, 
+    Blocks.TORCH,
+    Blocks.LADDER, 
+    Blocks.VINE, 
+    Blocks.SHORT_GRASS, 
+    Blocks.TALL_GRASS,
+    Blocks.RAIL,
+    Blocks.LEAF_LITTER,
+    Blocks.WILDFLOWERS
+    # ※ 注意: 一部のMODブロックやマイナーなブロックはBlocksクラスに存在しない場合があります
+])
 
-    def push(self, f, h, tie, item):
-        self.heap.append(item)
-        self.f_scores.append(f)
-        self.h_scores.append(h)
-        self.ties.append(tie)
-        self._up(len(self.heap) - 1)
-
-    def pop(self):
-        if len(self.heap) == 0:
-            return None
-        if len(self.heap) == 1:
-            self.f_scores.pop()
-            self.h_scores.pop()
-            self.ties.pop()
-            return self.heap.pop()
-        
-        root = self.heap[0]
-        self.heap[0] = self.heap.pop()
-        self.f_scores[0] = self.f_scores.pop()
-        self.h_scores[0] = self.h_scores.pop()
-        self.ties[0] = self.ties.pop()
-        
-        self._down(0)
-        return root
-
-    def is_empty(self):
-        return len(self.heap) == 0
-
-    def _is_less(self, i, j):
-        if self.f_scores[i] != self.f_scores[j]:
-            return self.f_scores[i] < self.f_scores[j]
-        if self.h_scores[i] != self.h_scores[j]:
-            return self.h_scores[i] < self.h_scores[j]
-        return self.ties[i] < self.ties[j]
-
-    def _swap(self, i, j):
-        t_item = self.heap[i]
-        self.heap[i] = self.heap[j]
-        self.heap[j] = t_item
-        
-        t_f = self.f_scores[i]
-        self.f_scores[i] = self.f_scores[j]
-        self.f_scores[j] = t_f
-        
-        t_h = self.h_scores[i]
-        self.h_scores[i] = self.h_scores[j]
-        self.h_scores[j] = t_h
-        
-        t_tie = self.ties[i]
-        self.ties[i] = self.ties[j]
-        self.ties[j] = t_tie
-
-    def _up(self, i):
-        while i > 0:
-            p = (i - 1) // 2
-            if self._is_less(i, p):
-                self._swap(i, p)
-                i = p
-            else:
-                break
-
-    def _down(self, i):
-        n = len(self.heap)
-        while 2 * i + 1 < n:
-            left = 2 * i + 1
-            right = 2 * i + 2
-            smallest = left
-            
-            if right < n and self._is_less(right, left):
-                smallest = right
-                
-            if self._is_less(smallest, i):
-                self._swap(i, smallest)
-                i = smallest
-            else:
-                break
-            
-AIRLIKE = {"minecraft:air", "minecraft:light"}
-LIQUIDS = {"minecraft:water", "minecraft:lava"}
-IGNORE_BLOCKS = {
-    "minecraft:air", "minecraft:oak_sign", "minecraft:poppy", "minecraft:torch",
-    "minecraft:ladder", "minecraft:vine", "minecraft:short_grass", "minecraft:tall_grass",
-    "minecraft:leaf_litter", "minecraft:wildflower", "minecraft:rail"
-}
 MAX_VERTICAL_STEP = 1
-EYE_HEIGHT = 1.62
-BODY_RADIUS = 0.8
-BODY_SAMPLE_LEVELS = (0.2, 0.9, 1.5)
-ENTITY_HEIGHT = 2.1
-LOS_EYE_OFFSETS = ((-0.25, -0.25), (-0.25, 0.25), (0.25, -0.25), (0.25, 0.25), (0.0, 0.0))
+BODY_RADIUS = 0.3
 LOS_BODY_OFFSETS = ((-BODY_RADIUS, -BODY_RADIUS), (-BODY_RADIUS, BODY_RADIUS), (BODY_RADIUS, -BODY_RADIUS), (BODY_RADIUS, BODY_RADIUS), (0.0, 0.0))
 
 COST_CARDINAL = 1.0
@@ -155,72 +88,87 @@ COST_STEP_CARD = Math.sqrt(2.0)
 COST_STEP_DIAG = Math.sqrt(3.5)
 HEURISTIC_WEIGHT = 1.3
 
-def is_bottom_slab(b: str) -> bool:
-    return ("slab" in b) and ("double" not in b) and (
-        "bottom" in b or "type=bottom" in b or "_bottom" in b
-    )
+# utility functions for block checks
 
-def is_passable(block_id: str) -> bool:
-    if not block_id: return True
-    b = block_id.lower()
-    b = b.split("[")[0]
-    return b in AIRLIKE or b in IGNORE_BLOCKS or is_bottom_slab(b)
+def is_bottom_slab(state):
+    block = state.getBlock()
+    if not isinstance(block, SlabBlock):
+        return False
+    try:
+        slab_type = state.getValue(SlabBlock.TYPE)
+        return slab_type == SlabType.BOTTOM
+    except:
+        return False
 
-def is_supportive(block_id: str) -> bool:
-    if not block_id: return False
-    b = block_id.lower()
-    b = b.split("[")[0]
-    if b in LIQUIDS or b in AIRLIKE or b in IGNORE_BLOCKS: return False
-    return True
-
-def get_block_cached(x, y, z, cache):
+def get_state_cached(x, y, z, cache):
     key = (x, y, z)
     if key not in cache:
-        cache[key] = getblock(x, y, z)
+        cache[key] = level.getBlockState(mutable_pos.set(x, y, z))
     return cache[key]
 
-def get_block_lower_cached(x, y, z, cache):
-    key = ("lower", x, y, z)
-    if key not in cache:
-        block = get_block_cached(x, y, z, cache)
-        cache[key] = block.lower() if block else ""
-    return cache[key]
+def is_passable(state):
+    block = state.getBlock()
+    
+    if AIRLIKE.contains(block) or IGNORE_BLOCKS.contains(block):
+        return True
+    if is_bottom_slab(state):
+        return True
+        
+    return False
+
+def is_supportive(state):
+    block = state.getBlock()
+    return not (LIQUIDS.contains(block) or AIRLIKE.contains(block) or IGNORE_BLOCKS.contains(block))
 
 def is_supportive_cached(x, y, z, cache):
     key = ("sup", x, y, z)
-
     if key not in cache:
-        cache[key] = is_supportive(
-            get_block_cached(x, y, z, cache)
-        )
-
+        cache[key] = is_supportive(get_state_cached(x, y, z, cache))
     return cache[key]
 
-def is_solid_cached(x, y, z, cache) -> bool:
+def is_solid_cached(x, y, z, cache):
     key = ("solid", x, y, z)
     if key not in cache:
-        b = get_block_lower_cached(x, y, z, cache)
-        b = b.split("[")[0]
-        cache[key] = bool(b) and not (b in AIRLIKE or b in IGNORE_BLOCKS)
+        state = get_state_cached(x, y, z, cache)
+        cache[key] = state.getMaterial().isSolid() 
     return cache[key]
 
 def has_clearance_cached(x, y, z, cache):
-    key = ("clr", x, y, z)
-
+    ix, iy, iz = int(Math.floor(x)), int(Math.floor(y)), int(Math.floor(z))
+    key = ("clr", ix, iy, iz)
     if key not in cache:
-        cache[key] = (
-            is_passable(get_block_cached(x, y, z, cache))
-            and
-            is_passable(get_block_cached(x, y + 1, z, cache))
-        )
-
+        s1 = get_state_cached(ix, iy, iz, cache)
+        s2 = get_state_cached(ix, iy + 1, iz, cache)
+        cache[key] = is_passable(s1) and is_passable(s2)
     return cache[key]
 
-def has_clearance(x, y, z, cache) -> bool:
-    return is_passable(get_block_cached(x, y, z, cache)) and is_passable(get_block_cached(x, y + 1, z, cache))
+class MinHeap:
 
+    def __init__(self):
+        self.pq = Queue()
+        self.registry = {}
+
+    def push(self, f, h, tie, item):
+        key_str = f"{f:014.4f}_{h:014.4f}_{tie:010d}"
+        self.pq.add(key_str)
+        self.registry[key_str] = item
+
+    def pop(self):
+        if self.pq.isEmpty():
+            return None
+    
+        key_str = self.pq.poll()
+        item = self.registry[key_str]
+        del self.registry[key_str]
+        
+        return item
+
+    def is_empty(self):
+        return self.pq.isEmpty()
+    
 class Node:
     __slots__ = ("pos","parent","G","H")
+
     def __init__(self, pos, parent=None):
         self.pos = (int(Math.floor(pos[0])), int(Math.floor(pos[1])), int(Math.floor(pos[2])))
         self.parent = parent
@@ -229,9 +177,6 @@ class Node:
 
     def F(self):
         return self.G + HEURISTIC_WEIGHT * self.H
-
-    def __lt__(self, other):
-        return (self.F(), self.H, self.pos) < (other.F(), other.H, other.pos)
 
     def heuristic(self, goal):
             px, py, pz = self.pos
@@ -246,12 +191,12 @@ class Node:
         if int(Math.abs(dx)) == 1 and int(Math.abs(dz)) == 1:
             base_y = int(Math.min(cy, ny))
             if (ny - cy) > 0:
-                if not has_clearance(cx, base_y, cz + dz, cache): 
+                if not has_clearance_cached(cx, base_y, cz + dz, cache): 
                     return False
             else:
-                if not has_clearance(cx + dx, base_y, cz, cache): 
+                if not has_clearance_cached(cx + dx, base_y, cz, cache): 
                     return False
-                if not has_clearance(cx, base_y, cz + dz, cache): 
+                if not has_clearance_cached(cx, base_y, cz + dz, cache): 
                     return False
         return True
 
@@ -282,10 +227,11 @@ class Node:
                 return False
 
         if dy < 0:
+            state_above = get_state_cached(nx, cy + 1, nz, cache)
             if not has_clearance_cached(nx, cy, nz, cache):
                 cache[key] = False
                 return False
-            if not is_passable(get_block_cached(nx, cy + 1, nz, cache)):
+            if not is_passable(state_above):
                 cache[key] = False
                 return False
 
@@ -315,6 +261,8 @@ class Node:
                 if self.is_walkable(p, cache): result.append((p, COST_STEP_CARD if base_cost == COST_CARDINAL else COST_STEP_DIAG))
         return result
 
+
+# path reconstruction and smoothing
 def reconstruct_path(node):
     path = []
     while node:
@@ -345,26 +293,29 @@ def get_direction_table(path):
 def LOS(a, b, cache):
     x0, y0, z0 = a
     x1, y1, z1 = b
-
-    dx = x1 - x0
-    dy = y1 - y0
-    dz = z1 - z0
-
-    steps = max(abs(dx), abs(dy), abs(dz))
+    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+    steps = max(abs(dx), abs(dy), abs(dz)) * 2
     if steps == 0:
         return True
 
     for i in range(steps + 1):
         t = i / steps
+        cx = x0 + dx * t
+        cy = y0 + dy * t
+        cz = z0 + dz * t
+        cy_i = round(cy)
 
-        x = round(x0 + dx * t)
-        y = round(y0 + dy * t)
-        z = round(z0 + dz * t)
+        seen = set()
+        for ox, oz in LOS_BODY_OFFSETS:
+            bx = round(cx + ox)
+            bz = round(cz + oz)
+            if (bx, bz) in seen:
+                continue
+            seen.add((bx, bz))
+            if not has_clearance_cached(bx, cy_i, bz, cache):
+                return False
 
-        if not has_clearance_cached(x, y, z, cache):
-            return False
-
-        if not is_supportive_cached(x, y - 1, z, cache):
+        if not is_supportive_cached(round(cx), cy_i - 1, round(cz), cache):
             return False
 
     return True
@@ -390,8 +341,12 @@ def smooth_path(path, cache):
                 break
             j += 1
 
-        result.append(path[j - 1])
-        i = j - 1
+        next_index = j - 1
+        if next_index == i:
+            next_index = i + 1
+
+        result.append(path[next_index])
+        i = next_index
 
     return result
 
@@ -425,9 +380,11 @@ def path_find(start, goal, do_smooth=True):
             continue
         if current.pos == goal:
             raw_path = reconstruct_path(current)
-            final_path = smooth_path(raw_path, cache) if do_smooth else raw_path
+            final_path = raw_path
             
             elapsed = (System.currentTimeMillis() - start_time) / 1000.0
+            echo(f"Expanded: {len(closed)}")
+            echo(f"Generated: {tie_breaker}")
             echo(f"Pathfinding took {elapsed:.3f}s")
             return final_path
 
@@ -514,6 +471,8 @@ def goto(x, y, z):
 
     return path_future
 
+
+#movement and rotation functions
 def normalize_angle(angle):
     return (angle + 180.0) % 360.0 - 180.0
 
@@ -798,19 +757,20 @@ def on_render(e):
 
     jump_cooldown = max(0, jump_cooldown - 1)
 
-    block_below = get_block(tx, ty - 1, tz)
-    is_slab_block = is_bottom_slab(str(block_below))
+    state_below = level.getBlockState(mutable_pos.set(tx, ty - 1, tz))
+    is_slab_block = is_bottom_slab(state_below)
     should_normal_jump = False
 
+    chev_dist = max(Math.abs(dx), Math.abs(dz))
     if not is_slab_block:
-        if dy > 0.8 and dist < 2.2:
+        if dy > 0.8 and chev_dist < 2.2:
             should_normal_jump = True
-        elif dy > 1.2 and dist < 3:
+        elif dy > 1.2 and chev_dist < 3:
             should_normal_jump = True
 
     if should_normal_jump and jump_cooldown <= 0:
         jump(True)
-        jump_cooldown = 7 
+        jump_cooldown = 4 
     else:
         jump(False)
 
