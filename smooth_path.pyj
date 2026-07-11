@@ -15,23 +15,19 @@ GizmoStyle      = JavaClass("net.minecraft.gizmos.GizmoStyle")
 
 Blocks = JavaClass("net.minecraft.world.level.block.Blocks")
 BlockState = JavaClass("net.minecraft.world.level.block.state.BlockState")
-BuiltInRegistries = JavaClass("net.minecraft.core.registries.BuiltInRegistries")
-SlabBlock = JavaClass("net.minecraft.world.level.block.SlabBlock")
-SlabType = JavaClass("net.minecraft.world.level.block.state.properties.SlabType")
 MutableBlockPos = JavaClass("net.minecraft.core.BlockPos$MutableBlockPos")
 BlockPos        = JavaClass("net.minecraft.core.BlockPos")
 
-Vec3            = JavaClass("net.minecraft.world.phys.Vec3")
-AABB            = JavaClass("net.minecraft.world.phys.AABB")
+Vec3 = JavaClass("net.minecraft.world.phys.Vec3")
 LineGizmo = JavaClass("net.minecraft.gizmos.LineGizmo")
 Direction       = JavaClass("net.minecraft.core.Direction")
 ARGB            = JavaClass("net.minecraft.util.ARGB")
 
 color       = ARGB.color(255, 0, 200, 255)
 fill_color  = ARGB.color(60,  0, 200, 255)
-style       = GizmoStyle.stroke(color)
-filled      = GizmoStyle.strokeAndFill(color, JavaFloat(1.5), fill_color)
 line_color = ARGB.color(100, 0, 230, 255)
+
+filled      = GizmoStyle.strokeAndFill(color, JavaFloat(1.5), fill_color)
 line_width = JavaFloat(5.0)
 
 mc = Minecraft.getInstance()
@@ -52,65 +48,59 @@ debug_timer = 0
 path_future = None
 
 FINAL_WAYPOINT_THRESHOLD = 0.5
-NORMAL_WAYPOINT_THRESHOLD = 1.5
-WAYPOINT_OVERSHOOT_THRESHOLD = 0.2
-
-def create_set_from_blocks(block_list):
-    h_set = HashSet()
-    for block in block_list:
-        h_set.add(block)
-    return h_set
-
-AIRLIKE = create_set_from_blocks([Blocks.AIR, Blocks.LIGHT])
-LIQUIDS = create_set_from_blocks([Blocks.WATER, Blocks.LAVA])
-IGNORE_BLOCKS = create_set_from_blocks([
-    Blocks.AIR, 
-    Blocks.OAK_SIGN, 
-    Blocks.POPPY, 
-    Blocks.TORCH,
-    Blocks.LADDER, 
-    Blocks.VINE, 
-    Blocks.SHORT_GRASS, 
-    Blocks.TALL_GRASS,
-    Blocks.RAIL,
-    Blocks.LEAF_LITTER,
-    Blocks.WILDFLOWERS,
-    Blocks.RED_CARPET,
-    Blocks.PINK_CARPET,
-    Blocks.GRAY_CARPET,
-    Blocks.BROWN_CARPET,
-    Blocks.LIGHT_BLUE_CARPET,
-    Blocks.LIGHT_GRAY_CARPET,
-    Blocks.BLUE_CARPET,
-])
+NORMAL_WAYPOINT_THRESHOLD = 1.2
+WAYPOINT_OVERSHOOT_THRESHOLD = 0.3
 
 MAX_VERTICAL_STEP = 1
-BODY_RADIUS = 0.3
+BODY_RADIUS = 0.4
 LOS_BODY_OFFSETS = ((-BODY_RADIUS, -BODY_RADIUS), (-BODY_RADIUS, BODY_RADIUS), (BODY_RADIUS, -BODY_RADIUS), (BODY_RADIUS, BODY_RADIUS), (0.0, 0.0))
 COST_CARDINAL = 1.0
 COST_DIAGONAL = Math.sqrt(2.0)
 COST_STEP_CARD = Math.sqrt(2.0)
 COST_STEP_DIAG = Math.sqrt(3.5)
-HEURISTIC_WEIGHT = 1.8
+HEURISTIC_WEIGHT = 1.25
 Y_UP_PENALTY = 1.0
 Y_DOWN_PENALTY = 0.5
-MARGIN = 48
+MARGIN = 128
 
 DIRS = [
             (1, 0, COST_CARDINAL), (-1, 0, COST_CARDINAL), (0, 1, COST_CARDINAL), (0, -1, COST_CARDINAL),
             (1, 1, COST_DIAGONAL), (1, -1, COST_DIAGONAL), (-1, 1, COST_DIAGONAL), (-1, -1, COST_DIAGONAL)
 ]
 
+DIR_TO_ID = {
+    ( 1, -1,  0): 0,
+    ( 1,  0,  0): 1,
+    ( 1,  1,  0): 2,
 
-def is_bottom_slab(state):
-    block = state.getBlock()
-    if not isinstance(block, SlabBlock):
-        return False
-    try:
-        slab_type = state.getValue(SlabBlock.TYPE)
-        return slab_type == SlabType.BOTTOM
-    except:
-        return False
+    (-1, -1,  0): 3,
+    (-1,  0,  0): 4,
+    (-1,  1,  0): 5,
+
+    ( 0, -1,  1): 6,
+    ( 0,  0,  1): 7,
+    ( 0,  1,  1): 8,
+
+    ( 0, -1, -1): 9,
+    ( 0,  0, -1): 10,
+    ( 0,  1, -1): 11,
+
+    ( 1, -1,  1): 12,
+    ( 1,  0,  1): 13,
+    ( 1,  1,  1): 14,
+
+    ( 1, -1, -1): 15,
+    ( 1,  0, -1): 16,
+    ( 1,  1, -1): 17,
+
+    (-1, -1,  1): 18,
+    (-1,  0,  1): 19,
+    (-1,  1,  1): 20,
+
+    (-1, -1, -1): 21,
+    (-1,  0, -1): 22,
+    (-1,  1, -1): 23,
+}
 
 def get_state_cached(x, y, z, cache):
     key = (x, y, z)
@@ -120,45 +110,46 @@ def get_state_cached(x, y, z, cache):
         cache.state.put(key, state)
     return state
 
-def is_passable(state):
-    block = state.getBlock()
-    
-    if AIRLIKE.contains(block) or IGNORE_BLOCKS.contains(block):
-        return True
-    if is_bottom_slab(state):
-        return True
-        
-    return False
+def get_profile_cached(x, y, z, cache):
+    state = get_state_cached(x, y, z, cache)
+ 
+    cached = cache.profile_by_state.get(state)
+    if cached is not None:
+        return cached
+ 
+    if state.isAir():
+        result = (False, 0.0)
+    elif not state.getFluidState().isEmpty():
+        result = (True, 0.0)
+    else:
+        shape = state.getCollisionShape(level, mutable_pos.set(x, y, z))
+        max_y = 0.0 if shape.isEmpty() else float(shape.bounds().maxY)
+        result = (False, max_y)
+ 
+    cache.profile_by_state.put(state, result)
+    return result
 
-def is_supportive(state):
-    block = state.getBlock()
-    return not (LIQUIDS.contains(block) or AIRLIKE.contains(block) or IGNORE_BLOCKS.contains(block))
-    
+def blocks_body(x, y, z, cache):
+    is_liquid, max_y = get_profile_cached(x, y, z, cache)
+    return is_liquid or max_y > 0.5 + 1e-4
+
 def is_supportive_cached(x, y, z, cache):
-    key = (x, y, z)
-    val = cache.sup.get(key)
-    if val is None:
-        val = is_supportive(get_state_cached(x, y, z, cache))
-        cache.sup.put(key, val)
-    return val
-
-def is_solid_cached(x, y, z, cache):
-    key = (x, y, z)
-    val = cache.solid.get(key)
-    if val is None:
-        state = get_state_cached(x, y, z, cache)
-        val = state.getMaterial().isSolid()
-        cache.solid.put(key, val)
-    return val
+    is_liquid, max_y = get_profile_cached(x, y, z, cache)
+    return (not is_liquid) and max_y > 1e-4
 
 def has_clearance_cached(x, y, z, cache):
-    ix, iy, iz = int(Math.floor(x)), int(Math.floor(y)), int(Math.floor(z))
-    key = (ix, iy, iz)
+    key = (x, y, z)
     val = cache.clr.get(key)
     if val is None:
-        s1 = get_state_cached(ix, iy, iz, cache)
-        s2 = get_state_cached(ix, iy + 1, iz, cache)
-        val = is_passable(s1) and is_passable(s2)
+        if blocks_body(x, y, z, cache) or blocks_body(x, y + 1, z, cache):
+            val = False
+        else:
+            _, ground_max_y = get_profile_cached(x, y - 1, z, cache)
+            if ground_max_y > 0.2 + 1e-4:
+                val = not blocks_body(x, y + 2, z, cache)
+            else:
+                val = True
+                
         cache.clr.put(key, val)
     return val
 
@@ -175,39 +166,40 @@ def diagonal_clearance_ok(cx, cy, cz, nx, ny, nz, cache):
 def is_walkable(from_pos, to_pos, cache):
     cx, cy, cz = from_pos
     nx, ny, nz = to_pos
-
+ 
+    dy = ny - cy
     key = (cx, cy, cz, nx, ny, nz)
+
     cached = cache.walk.get(key)
     if cached is not None:
         return cached
-
-    dy = ny - cy
-
-    if int(Math.abs(dy)) > MAX_VERTICAL_STEP:
+ 
+    if abs(dy) > MAX_VERTICAL_STEP:
         cache.walk.put(key, False)
         return False
-
-    if not has_clearance_cached(nx, ny, nz, cache):
-        cache.walk.put(key, False)
-        return False
-
+ 
     if not is_supportive_cached(nx, ny - 1, nz, cache):
         cache.walk.put(key, False)
         return False
+ 
+    if not has_clearance_cached(nx, ny, nz, cache):
+        cache.walk.put(key, False)
+        return False
+ 
     if dy > 0:
         if not has_clearance_cached(cx, cy + 1, cz, cache):
             cache.walk.put(key, False)
             return False
-
+ 
     if dy < 0:
         if not has_clearance_cached(nx, cy, nz, cache):
             cache.walk.put(key, False)
             return False
-
+ 
     if not diagonal_clearance_ok(cx, cy, cz, nx, ny, nz, cache):
         cache.walk.put(key, False)
         return False
-
+ 
     cache.walk.put(key, True)
     return True
 
@@ -235,53 +227,54 @@ class MinHeap:
         return self.pq.isEmpty()
     
 class PathCache:
-    __slots__ = ("state", "sup", "solid", "clr", "walk", "jump")
+    __slots__ = ("state", "clr", "walk", "jump", "profile_by_state")
 
     def __init__(self):
         self.state = HashMap()
-        self.sup   = HashMap()
-        self.solid = HashMap()
         self.clr   = HashMap()
         self.walk  = HashMap()
         self.jump  = HashMap()
+        self.profile_by_state = HashMap()
 
 class Node:
     __slots__ = ("pos","parent","G","H")
-
+ 
     def __init__(self, pos, parent=None):
         self.pos = (int(Math.floor(pos[0])), int(Math.floor(pos[1])), int(Math.floor(pos[2])))
         self.parent = parent
         self.G = 0.0
         self.H = 0.0
-
+ 
     def F(self):
         return self.G + HEURISTIC_WEIGHT * self.H
-
+ 
     def heuristic(self, goal):
         px, py, pz = self.pos
         gx, gy, gz = goal
-
+ 
         dx = abs(px - gx)
-        dy = abs(py - gy)
         dz = abs(pz - gz)
-
+        dy_signed = gy - py
+        dy = abs(dy_signed)
+ 
         mn = min(dx, dy, dz)
         mx = max(dx, dy, dz)
         md = dx + dy + dz - mn - mx
-
+ 
         D = 1.0
         D2 = COST_DIAGONAL
         D3 = COST_STEP_DIAG
-
+ 
         h = D3 * mn + D2 * (md - mn) + D * (mx - md)
-
+        h += dy * (Y_UP_PENALTY if dy_signed > 0 else Y_DOWN_PENALTY)
+ 
         p = 1.0 / 1000.0
         return h * (1.0 + p)
-
+ 
     def get_pruned_dirs(self, parent, cache):
         x,y,z = self.pos
         pos = self.pos
-
+ 
         if parent is None:
             result = []
             for dx, dz, base_cost in DIRS:
@@ -302,9 +295,9 @@ class Node:
         dirs = []
         dx = max(-1, min(1, x - px))
         dz = max(-1, min(1, z - pz))
-
+ 
         if dx != 0 and dz != 0:
-
+ 
             for ny in (y, y + 1, y - 1):
                 if is_walkable(pos, (x + dx, ny, z), cache):
                     dirs.append((dx, ny - y, 0))
@@ -317,65 +310,64 @@ class Node:
                 if is_walkable(pos, (x + dx, ny, z + dz), cache):
                     dirs.append((dx, ny - y, dz))
                     break
-
+ 
         else:
             for ny in (y, y + 1, y - 1):
                 if is_walkable(pos, (x + dx, ny, z + dz), cache):
                     dirs.append((dx, ny - y, dz))
                     break
-
+ 
             if dx != 0:
                 if (not is_walkable(pos, (x - dx, y, z - 1), cache) and is_walkable(pos, (x, y, z - 1), cache)):
-
+ 
                     for ny in (y, y + 1, y - 1):
                         if is_walkable(pos, (x, ny, z - 1), cache):
                             dirs.append((0, ny - y, -1))
                             break
-
+ 
                     for ny in (y, y + 1, y - 1):
                         if is_walkable(pos, (x + dx, ny, z - 1), cache):
                             dirs.append((dx, ny - y, -1))
                             break
-
+ 
                 if (not is_walkable(pos, (x - dx, y, z + 1), cache) and is_walkable(pos, (x, y, z + 1), cache)):
-
+ 
                     for ny in (y, y + 1, y - 1):
                         if is_walkable(pos, (x, ny, z + 1), cache):
                             dirs.append((0, ny - y, 1))
                             break
-
+ 
                     for ny in (y, y + 1, y - 1):
                         if is_walkable(pos, (x + dx, ny, z + 1), cache):
                             dirs.append((dx, ny - y, 1))
                             break
-
+ 
             else:
                 if (not is_walkable(pos, (x - 1, y, z - dz), cache) and is_walkable(pos, (x - 1, y, z), cache)):
-
+ 
                     for ny in (y, y + 1, y - 1):
                         if is_walkable(pos, (x - 1, ny, z), cache):
                             dirs.append((-1, ny - y, 0))
                             break
-
+ 
                     for ny in (y, y + 1, y - 1):
                         if is_walkable(pos, (x - 1, ny, z + dz), cache):
                             dirs.append((-1, ny - y, dz))
                             break
-
+ 
                 if (not is_walkable(pos, (x + 1, y, z - dz), cache) and is_walkable(pos, (x + 1, y, z), cache)):
-
+ 
                     for ny in (y, y + 1, y - 1):
                         if is_walkable(pos, (x + 1, ny, z), cache):
                             dirs.append((1, ny - y, 0))
                             break
-
+ 
                     for ny in (y, y + 1, y - 1):
                         if is_walkable(pos, (x + 1, ny, z + dz), cache):
                             dirs.append((1, ny - y, dz))
                             break
         return dirs
-
-
+    
 # path reconstruction and smoothing
 def reconstruct_path(node):
     path = []
@@ -388,21 +380,6 @@ def reconstruct_path(node):
     for i in range(n):
         reversed_path.append(path[n - 1 - i])
     return reversed_path
-
-def get_direction_table(path):
-    directions = []
-
-    for i in range(1, len(path)):
-        x0, y0, z0 = path[i - 1]
-        x1, y1, z1 = path[i]
-
-        dx = x1 - x0
-        dy = y1 - y0
-        dz = z1 - z0
-
-        directions.append((dx, dy, dz))
-
-    return directions
 
 def LOS(a, b, cache):
     x0, y0, z0 = a
@@ -490,8 +467,10 @@ def smooth_path(path, cache):
         while j < len(path): 
             prev_y = path[j - 1][1] 
             current_y = path[j][1] 
-            if current_y > prev_y: 
-                if j == i + 1: j += 1 
+            
+            if current_y != prev_y: 
+                if j == i + 1: 
+                    j += 1 
                 break 
 
             if not LOS(path[i], path[j], cache): 
@@ -507,9 +486,6 @@ def smooth_path(path, cache):
         i = next_index 
     return result
 
-def get_direction(p1, p2):
-    return (p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2])
-
 def get_euclid_dist(p1, p2):
     return Math.sqrt(Math.pow(p1[0] - p2[0],2) + Math.pow(p1[1] - p2[1],2) + Math.pow(p1[2] - p2[2],2))
 
@@ -519,21 +495,30 @@ def movement_cost(a, b):
     return dist + dy * 1.5
 
 def path_jump(start_pos, direction, goal, cache, limits):
-    cache_key = (start_pos, direction)
-    if cache.jump.containsKey(cache_key):
-        return cache.jump.get(cache_key)
+    dir_id = DIR_TO_ID[direction]
 
-    current_pos = start_pos
+    start_key = BlockPos.asLong(start_pos[0], start_pos[1], start_pos[2])
+    cache_key = (start_key, dir_id)
+
+    cached = cache.jump.get(cache_key)
+
+    if cached is not None or cache.jump.containsKey(cache_key):
+        return cached
+
     dx, dy, dz = direction
-    
     limit_min_x, limit_max_x, limit_min_z, limit_max_z = limits
+    is_diagonal = (dx != 0 and dz != 0)
+    current_pos = start_pos
+    intermediate_nodes = []
+    jump_point = None
 
     while True:
         x, y, z = current_pos
         nx, nz = x + dx, z + dz
 
-        if not (limit_min_x <= nx <= limit_max_x and limit_min_z <= nz <= limit_max_z):
-            return None
+        if not (limit_min_x <= nx <= limit_max_x and
+                limit_min_z <= nz <= limit_max_z):
+            break
 
         ny = None
         if is_walkable(current_pos, (nx, y, nz), cache):
@@ -544,33 +529,45 @@ def path_jump(start_pos, direction, goal, cache, limits):
             ny = y + 1
 
         if ny is None:
-            cache.jump.put(cache_key, None)
-            return None
+            break
 
         next_pos = (nx, ny, nz)
 
         if next_pos == goal or ny != y:
-            cache.jump.put(cache_key, next_pos)
-            return next_pos
+            jump_point = next_pos
+            break
 
-        if dx != 0 and dz != 0:
+        if is_diagonal:
             if (path_jump(next_pos, (dx, 0, 0), goal, cache, limits) is not None or
                 path_jump(next_pos, (0, 0, dz), goal, cache, limits) is not None):
-                cache.jump.put(cache_key, next_pos)
-                return next_pos
+                jump_point = next_pos
+                break
         else:
             if dx != 0:
-                if ((not is_walkable(next_pos, (x, ny, nz - 1), cache) and is_walkable(next_pos, (nx, ny, nz - 1), cache)) or
-                    (not is_walkable(next_pos, (x, ny, nz + 1), cache) and is_walkable(next_pos, (nx, ny, nz + 1), cache))):
-                    cache.jump.put(cache_key, next_pos)
-                    return next_pos
+                if ((not is_walkable(next_pos, (x, ny, nz - 1), cache) and
+                     is_walkable(next_pos, (nx, ny, nz - 1), cache)) or
+                    (not is_walkable(next_pos, (x, ny, nz + 1), cache) and
+                     is_walkable(next_pos, (nx, ny, nz + 1), cache))):
+                    jump_point = next_pos
+                    break
             else:
-                if ((not is_walkable(next_pos, (nx - 1, ny, z), cache) and is_walkable(next_pos, (nx - 1, ny, nz), cache)) or
-                    (not is_walkable(next_pos, (nx + 1, ny, z), cache) and is_walkable(next_pos, (nx + 1, ny, nz), cache))):
-                    cache.jump.put(cache_key, next_pos)
-                    return next_pos
+                if ((not is_walkable(next_pos, (nx - 1, ny, z), cache) and
+                     is_walkable(next_pos, (nx - 1, ny, nz), cache)) or
+                    (not is_walkable(next_pos, (nx + 1, ny, z), cache) and
+                     is_walkable(next_pos, (nx + 1, ny, nz), cache))):
+                    jump_point = next_pos
+                    break
 
+        intermediate_nodes.append(next_pos)
         current_pos = next_pos
+
+    cache.jump.put(cache_key, jump_point)
+
+    for node in intermediate_nodes:
+        node_key = BlockPos.asLong(node[0], node[1], node[2])
+        cache.jump.put((node_key, dir_id), jump_point)
+
+    return jump_point
 
 def path_find(start, goal, do_smooth=True):
     start_time = System.currentTimeMillis()
@@ -609,6 +606,7 @@ def path_find(start, goal, do_smooth=True):
             raw_path = reconstruct_path(current)
             
             dense_path = interpolate_path(raw_path)
+            # dense_path = raw_path
             
             if do_smooth:
                 final_path = smooth_path(dense_path, cache)
@@ -657,7 +655,6 @@ def path_find(start, goal, do_smooth=True):
 
     echo("path not found")
     return None
-
     
 def goto(x, y, z):
     global current_path
@@ -991,15 +988,13 @@ def on_render(e):
     jump_cooldown = max(0, jump_cooldown - 1)
 
     state_below = level.getBlockState(mutable_pos.set(tx, ty - 1, tz))
-    is_slab_block = is_bottom_slab(state_below)
     should_normal_jump = False
 
     chev_dist = max(Math.abs(dx), Math.abs(dz))
-    if not is_slab_block:
-        if dy > 0.8 and chev_dist < 2.5:
-            should_normal_jump = True
-        elif dy > 1.2 and chev_dist < 3:
-            should_normal_jump = True
+    if dy > 0.8 and chev_dist < 2.5:
+        should_normal_jump = True
+    elif dy > 1.2 and chev_dist < 3:
+        should_normal_jump = True
 
     if should_normal_jump and jump_cooldown <= 0:
         jump(True)
