@@ -6,24 +6,18 @@ Math = JavaClass("java.lang.Math")
 Queue = JavaClass("java.util.PriorityQueue")
 System = JavaClass("java.lang.System")
 path_executor = JavaClass("java.util.concurrent.Executors").newSingleThreadExecutor()
-Thread = JavaClass("java.lang.Thread")
+Executors = JavaClass("java.util.concurrent.Executors")
+JavaRuntime = JavaClass("java.lang.Runtime")
 HashSet = JavaClass("java.util.HashSet")
 HashMap = JavaClass("java.util.HashMap")
-Random = JavaClass("java.util.Random")
 
 Gizmos = JavaClass("net.minecraft.gizmos.Gizmos")
 GizmoStyle = JavaClass("net.minecraft.gizmos.GizmoStyle")
 
-Blocks = JavaClass("net.minecraft.world.level.block.Blocks")
-BlockState = JavaClass("net.minecraft.world.level.block.state.BlockState")
 MutableBlockPos = JavaClass("net.minecraft.core.BlockPos$MutableBlockPos")
 BlockPos = JavaClass("net.minecraft.core.BlockPos")
 
-LevelChunk = JavaClass("net.minecraft.world.level.chunk.LevelChunk")
-
 Vec3 = JavaClass("net.minecraft.world.phys.Vec3")
-LineGizmo = JavaClass("net.minecraft.gizmos.LineGizmo")
-Direction = JavaClass("net.minecraft.core.Direction")
 ARGB = JavaClass("net.minecraft.util.ARGB")
 
 color       = ARGB.color(255, 0, 200, 255)
@@ -64,7 +58,7 @@ COST_STEP_DIAG = Math.sqrt(3.5)
 HEURISTIC_WEIGHT = 1.25
 Y_UP_PENALTY = 1.4
 Y_DOWN_PENALTY = 0.5
-MARGIN = 128
+MARGIN = 127
 
 DIRS = [
             (1, 0, COST_CARDINAL), (-1, 0, COST_CARDINAL), (0, 1, COST_CARDINAL), (0, -1, COST_CARDINAL),
@@ -105,104 +99,74 @@ DIR_TO_ID = {
     (-1,  1, -1): 23,
 }
 
-Executors = JavaClass("java.util.concurrent.Executors")
-JavaRuntime = JavaClass("java.lang.Runtime")
-
-
+fetched = 0
 def prefetch_chunks(limits, cache):
-    limit_min_x, limit_max_x, limit_min_z, limit_max_z = limits
+    global fetched
 
-    min_cx = limit_min_x // 16
-    max_cx = limit_max_x // 16
-    min_cz = limit_min_z // 16
-    max_cz = limit_max_z // 16
-
+    min_cx, max_cx = limits[0] // 16, limits[1] // 16
+    min_cz, max_cz = limits[2] // 16, limits[3] // 16
     chunk_coords = []
-    cx = min_cx
-    while cx <= max_cx:
-        cz = min_cz
-        while cz <= max_cz:
+
+    for cx in range(min_cx, max_cx + 1):
+        for cz in range(min_cz, max_cz + 1):
             chunk_coords.append((cx, cz))
-            cz += 1
-        cx += 1
 
-    if len(chunk_coords) <= 4:
-        return
-
-    cpu_count = JavaRuntime.getRuntime().availableProcessors()
-    num_threads = min(len(chunk_coords), min(32, cpu_count + 4))
-
-    def make_task(cx, cz):
-        return lambda: level.getChunk(cx, cz)
-
-    executor = Executors.newFixedThreadPool(num_threads)
+    coords_len = len(chunk_coords)
+    if coords_len <= 4:  return
+    threads = min(
+        coords_len,
+        min(32, JavaRuntime.getRuntime().availableProcessors() + 4)
+    )
+    def make_task(cx, cz): return lambda: level.getChunk(cx, cz)
+    executor = Executors.newFixedThreadPool(threads)
     futures = []
 
     try:
         for cx, cz in chunk_coords:
             futures.append(executor.submit(make_task(cx, cz)))
 
-        for i in range(len(chunk_coords)):
-            chunk_key = chunk_coords[i]
-            try:
-                chunk_data = futures[i].get()
-                if chunk_data is not None:
-                    cache.chunks.put(chunk_key, chunk_data)
-            except :
-                echo(f"Chunk {chunk_key} prefetch skipped:")
+        for i in range(coords_len):
+            coord = chunk_coords[i]
+            chunk = futures[i].get()
+
+            try: 
+                if chunk is not None:
+                    fetched += 1
+                    cache.chunks.put(coord, chunk)
+            except:
+                echo(f"Chunk {coord} prefetch skipped")
+
+        echo(f"Chunk prefetched: total {fetched}")
+
     finally:
         executor.shutdown()
 
 def get_state_cached(x, y, z, cache):
     key = (x, y, z)
-    state = cache.state.get(key)
-    
-    if state is not None:
+    if (state := cache.state.get(key)) is not None:
         return state
-        
-    cx = x // 16
-    cz = z // 16
-    chunk_key = (cx, cz)
-    
+    chunk_key = (x // 16, z // 16)
     chunk = cache.chunks.get(chunk_key)
     if chunk is None:
-        chunk = level.getChunk(cx, cz)
-        cache.chunks[chunk_key] = chunk
-
-    sections = chunk.getSections()
-    section_index = chunk.getSectionIndex(y)
-        
-    if sections is not None and 0 <= section_index < len(sections):
-            section = sections[section_index]
-            
-            if section is None or section.hasOnlyAir():
-                state = cache.air_state
-            else:
-                state = section.getBlockState(x % 16, y % 16, z % 16)
-    else:
-            state = cache.air_state
-        
+        chunk = level.getChunk(*chunk_key)
+        cache.chunks.put(chunk_key, chunk)
+    state = chunk.getBlockState(mutable_pos.set(x, y, z))
     cache.state.put(key, state)
     return state
 
 def get_profile_cached(x, y, z, cache):
     state = get_state_cached(x, y, z, cache)
- 
-    cached = cache.profile_by_state.get(state)
-    if cached is not None:
+    if (cached := cache.profile_by_state.get(state)) is not None:
         return cached
- 
     if state.isAir():
-        result = (False, 0.0)
+        profile = (False, 0.0)
     elif not state.getFluidState().isEmpty():
-        result = (True, 0.0)
+        profile = (True, 0.0)
     else:
         shape = state.getCollisionShape(level, mutable_pos.set(x, y, z))
-        max_y = 0.0 if shape.isEmpty() else float(shape.bounds().maxY)
-        result = (False, max_y)
- 
-    cache.profile_by_state.put(state, result)
-    return result
+        profile = (False, 0.0 if shape.isEmpty() else float(shape.bounds().maxY))
+    cache.profile_by_state.put(state, profile)
+    return profile
 
 def blocks_body(x, y, z, cache):
     is_liquid, max_y = get_profile_cached(x, y, z, cache)
@@ -214,69 +178,68 @@ def is_supportive_cached(x, y, z, cache):
 
 def has_clearance_cached(x, y, z, cache):
     key = (x, y, z)
-    val = cache.clr.get(key)
-    if val is None:
-        if blocks_body(x, y, z, cache) or blocks_body(x, y + 1, z, cache):
-            val = False
-        else:
-            _, ground_max_y = get_profile_cached(x, y - 1, z, cache)
-            if ground_max_y > 1.2 + 1e-4:
-                val = not blocks_body(x, y + 2, z, cache)
-            else:
-                val = True
-                
-        cache.clr.put(key, val)
-    return val
+    if (cached := cache.clr.get(key)) is not None:
+        return cached
+    if blocks_body(x, y, z, cache) or blocks_body(x, y + 1, z, cache):
+        result = False
+    else:
+        _, ground = get_profile_cached(x, y - 1, z, cache)
+        result = (
+            not blocks_body(x, y + 2, z, cache)
+            if ground > 1.2 + 1e-4
+            else True
+        )
+    cache.clr.put(key, result)
+    return result
 
 def diagonal_clearance_ok(cx, cy, cz, nx, ny, nz, cache):
     dx, dz = nx - cx, nz - cz
-    if int(Math.abs(dx)) == 1 and int(Math.abs(dz)) == 1:
-        base_y = int(Math.min(cy, ny))
-        if not has_clearance_cached(cx + dx, base_y, cz, cache):
-            return False
-        if not has_clearance_cached(cx, base_y, cz + dz, cache):
-            return False
-    return True
+    if abs(dx) != 1 or abs(dz) != 1: return True
+    y = min(cy, ny)
+    return (has_clearance_cached(cx + dx, y, cz, cache)
+        and has_clearance_cached(cx, y, cz + dz, cache))
 
 def is_walkable(from_pos, to_pos, cache):
     cx, cy, cz = from_pos
     nx, ny, nz = to_pos
- 
-    dy = ny - cy
-    key = (cx, cy, cz, nx, ny, nz)
-
-    cached = cache.walk.get(key)
-    if cached is not None:
+    key = (*from_pos, *to_pos)
+    if (cached := cache.walk.get(key)) is not None:
         return cached
- 
-    if abs(dy) > MAX_VERTICAL_STEP:
-        cache.walk.put(key, False)
-        return False
- 
-    if not is_supportive_cached(nx, ny - 1, nz, cache):
-        cache.walk.put(key, False)
-        return False
- 
-    if not has_clearance_cached(nx, ny, nz, cache):
-        cache.walk.put(key, False)
-        return False
- 
-    if dy > 0:
-        if not has_clearance_cached(cx, cy + 1, cz, cache):
-            cache.walk.put(key, False)
-            return False
- 
-    if dy < 0:
-        if not has_clearance_cached(nx, cy, nz, cache):
-            cache.walk.put(key, False)
-            return False
- 
-    if not diagonal_clearance_ok(cx, cy, cz, nx, ny, nz, cache):
-        cache.walk.put(key, False)
-        return False
- 
-    cache.walk.put(key, True)
-    return True
+    dy = ny - cy
+    result = (
+        abs(dy) <= MAX_VERTICAL_STEP
+        and is_supportive_cached(nx, ny - 1, nz, cache)
+        and has_clearance_cached(nx, ny, nz, cache)
+        and (dy <= 0 or has_clearance_cached(cx, cy + 1, cz, cache))
+        and (dy >= 0 or has_clearance_cached(nx, cy, nz, cache))
+        and diagonal_clearance_ok(cx, cy, cz, nx, ny, nz, cache)
+    )
+    cache.walk.put(key, result)
+    return result
+
+def try_add(dirs, pos, x, y, z, dx, dz, cache):
+    for ny in (y, y + 1, y - 1):
+        if is_walkable(pos, (x + dx, ny, z + dz), cache):
+            dirs.append((dx, ny - y, dz))
+            return
+        
+def next_y(pos, nx, y, nz, cache):
+    for ny in (y, y - 1, y + 1):
+        if is_walkable(pos, (nx, ny, nz), cache):
+            return ny
+
+
+def has_forced_neighbor(pos, prev_x, prev_z, dx, dz, cache):
+    x, y, z = pos
+    if dx: return ((not is_walkable(pos, (prev_x, y, z - 1), cache)
+                    and is_walkable(pos, (x, y, z - 1), cache)) or
+                    (not is_walkable(pos, (prev_x, y, z + 1), cache)
+                    and is_walkable(pos, (x, y, z + 1), cache)))
+
+    return ((not is_walkable(pos, (x - 1, y, prev_z), cache)
+            and is_walkable(pos, (x - 1, y, z), cache)) or
+            (not is_walkable(pos, (x + 1, y, prev_z), cache)
+            and is_walkable(pos, (x + 1, y, z), cache)))
 
 class MinHeap:
     def __init__(self):
@@ -284,7 +247,7 @@ class MinHeap:
         self.registry = {}
 
     def push(self, f, h, tie, item):
-        key_str = f"{f:014.4f}_{h:014.4f}_{tie:010d}"
+        key_str = (f, h, tie)
         self.pq.add(key_str)
         self.registry[key_str] = item
 
@@ -302,7 +265,7 @@ class MinHeap:
         return self.pq.isEmpty()
     
 class PathCache:
-    __slots__ = ("state", "clr", "walk", "jump", "profile_by_state", "chunks", "air_state")
+    __slots__ = ("state", "clr", "walk", "jump", "profile_by_state", "chunks")
 
     def __init__(self):
         self.state = HashMap()
@@ -311,138 +274,89 @@ class PathCache:
         self.jump  = HashMap()
         self.profile_by_state = HashMap()
         self.chunks = HashMap()
-        self.air_state = Blocks.AIR.defaultBlockState()
 
 class Node:
-    __slots__ = ("pos","parent","G","H")
- 
+    __slots__ = ("pos", "parent", "G", "H")
+
     def __init__(self, pos, parent=None):
-        self.pos = (int(Math.floor(pos[0])), int(Math.floor(pos[1])), int(Math.floor(pos[2])))
+        self.pos = (
+            int(Math.floor(pos[0])),
+            int(Math.floor(pos[1])),
+            int(Math.floor(pos[2]))
+        )
         self.parent = parent
         self.G = 0.0
         self.H = 0.0
- 
+
     def F(self):
         return self.G + HEURISTIC_WEIGHT * self.H
- 
+
     def heuristic(self, goal):
         px, py, pz = self.pos
         gx, gy, gz = goal
- 
-        dx = abs(px - gx)
-        dz = abs(pz - gz)
-        dy_signed = gy - py
-        dy = abs(dy_signed)
- 
-        mn = min(dx, dy, dz)
-        mx = max(dx, dy, dz)
-        md = dx + dy + dz - mn - mx
- 
-        D = 1.0
-        D2 = COST_DIAGONAL
-        D3 = COST_STEP_DIAG
- 
-        h = D3 * mn + D2 * (md - mn) + D * (mx - md)
-        h += dy * (Y_UP_PENALTY if dy_signed > 0 else Y_DOWN_PENALTY)
- 
-        p = 1.0 / 1000.0
-        return h * (1.0 + p)
- 
+
+        dx, dz = abs(px - gx), abs(pz - gz)
+        dy = gy - py
+        ady = abs(dy)
+
+        mn = min(dx, ady, dz)
+        mx = max(dx, ady, dz)
+        md = dx + ady + dz - mn - mx
+
+        h = (
+            COST_STEP_DIAG * mn
+            + COST_DIAGONAL * (md - mn)
+            + (mx - md)
+            + ady * (Y_UP_PENALTY if dy > 0 else Y_DOWN_PENALTY)
+        )
+
+        return h * 1.001
+
     def get_pruned_dirs(self, parent, cache):
-        x,y,z = self.pos
+        x, y, z = self.pos
         pos = self.pos
- 
+
         if parent is None:
-            result = []
-            for dx, dz, base_cost in DIRS:
-                px, py, pz = x + dx, y, z + dz
-                if is_walkable(pos, (px, py, pz), cache):
-                    result.append((dx, 0, dz))
-                else:
-                    px, py, pz = x + dx, y + 1, z + dz
-                    if is_walkable(pos, (px, py, pz), cache):
-                        result.append((dx, 1, dz))
-                    else:
-                        px, py, pz = x + dx, y - 1, z + dz
-                        if is_walkable(pos, (px, py, pz), cache):
-                            result.append((dx, -1, dz))
-            return result
-        
-        px,py,pz = parent
+            dirs = []
+            for dx, dz, _ in DIRS:
+                try_add(dirs, pos, x, y, z, dx, dz, cache)
+            return dirs
+
+        dx = max(-1, min(1, x - parent[0]))
+        dz = max(-1, min(1, z - parent[2]))
+
         dirs = []
-        dx = max(-1, min(1, x - px))
-        dz = max(-1, min(1, z - pz))
- 
-        if dx != 0 and dz != 0:
- 
-            for ny in (y, y + 1, y - 1):
-                if is_walkable(pos, (x + dx, ny, z), cache):
-                    dirs.append((dx, ny - y, 0))
-                    break
-            for ny in (y, y + 1, y - 1):
-                if is_walkable(pos, (x, ny, z + dz), cache):
-                    dirs.append((0, ny - y, dz))
-                    break
-            for ny in (y, y + 1, y - 1):
-                if is_walkable(pos, (x + dx, ny, z + dz), cache):
-                    dirs.append((dx, ny - y, dz))
-                    break
- 
+
+        if dx and dz:
+            try_add(dirs, pos, x, y, z, dx, 0, cache)
+            try_add(dirs, pos, x, y, z, 0, dz, cache)
+            try_add(dirs, pos, x, y, z, dx, dz, cache)
+            return dirs
+
+        try_add(dirs, pos, x, y, z, dx, dz, cache)
+
+        if dx:
+            if (not is_walkable(pos, (x - dx, y, z - 1), cache)
+                    and is_walkable(pos, (x, y, z - 1), cache)):
+                try_add(dirs, pos, x, y, z, 0, -1, cache)
+                try_add(dirs, pos, x, y, z, dx, -1, cache)
+
+            if (not is_walkable(pos, (x - dx, y, z + 1), cache)
+                    and is_walkable(pos, (x, y, z + 1), cache)):
+                try_add(dirs, pos, x, y, z, 0, 1, cache)
+                try_add(dirs, pos, x, y, z, dx, 1, cache)
+
         else:
-            for ny in (y, y + 1, y - 1):
-                if is_walkable(pos, (x + dx, ny, z + dz), cache):
-                    dirs.append((dx, ny - y, dz))
-                    break
- 
-            if dx != 0:
-                if (not is_walkable(pos, (x - dx, y, z - 1), cache) and is_walkable(pos, (x, y, z - 1), cache)):
- 
-                    for ny in (y, y + 1, y - 1):
-                        if is_walkable(pos, (x, ny, z - 1), cache):
-                            dirs.append((0, ny - y, -1))
-                            break
- 
-                    for ny in (y, y + 1, y - 1):
-                        if is_walkable(pos, (x + dx, ny, z - 1), cache):
-                            dirs.append((dx, ny - y, -1))
-                            break
- 
-                if (not is_walkable(pos, (x - dx, y, z + 1), cache) and is_walkable(pos, (x, y, z + 1), cache)):
- 
-                    for ny in (y, y + 1, y - 1):
-                        if is_walkable(pos, (x, ny, z + 1), cache):
-                            dirs.append((0, ny - y, 1))
-                            break
- 
-                    for ny in (y, y + 1, y - 1):
-                        if is_walkable(pos, (x + dx, ny, z + 1), cache):
-                            dirs.append((dx, ny - y, 1))
-                            break
- 
-            else:
-                if (not is_walkable(pos, (x - 1, y, z - dz), cache) and is_walkable(pos, (x - 1, y, z), cache)):
- 
-                    for ny in (y, y + 1, y - 1):
-                        if is_walkable(pos, (x - 1, ny, z), cache):
-                            dirs.append((-1, ny - y, 0))
-                            break
- 
-                    for ny in (y, y + 1, y - 1):
-                        if is_walkable(pos, (x - 1, ny, z + dz), cache):
-                            dirs.append((-1, ny - y, dz))
-                            break
- 
-                if (not is_walkable(pos, (x + 1, y, z - dz), cache) and is_walkable(pos, (x + 1, y, z), cache)):
- 
-                    for ny in (y, y + 1, y - 1):
-                        if is_walkable(pos, (x + 1, ny, z), cache):
-                            dirs.append((1, ny - y, 0))
-                            break
- 
-                    for ny in (y, y + 1, y - 1):
-                        if is_walkable(pos, (x + 1, ny, z + dz), cache):
-                            dirs.append((1, ny - y, dz))
-                            break
+            if (not is_walkable(pos, (x - 1, y, z - dz), cache)
+                    and is_walkable(pos, (x - 1, y, z), cache)):
+                try_add(dirs, pos, x, y, z, -1, 0, cache)
+                try_add(dirs, pos, x, y, z, -1, dz, cache)
+
+            if (not is_walkable(pos, (x + 1, y, z - dz), cache)
+                    and is_walkable(pos, (x + 1, y, z), cache)):
+                try_add(dirs, pos, x, y, z, 1, 0, cache)
+                try_add(dirs, pos, x, y, z, 1, dz, cache)
+
         return dirs
     
 # path reconstruction and smoothing
@@ -451,241 +365,175 @@ def reconstruct_path(node):
     while node:
         path.append(node.pos)
         node = node.parent
-    
-    reversed_path = []
-    n = len(path)
-    for i in range(n):
-        reversed_path.append(path[n - 1 - i])
-    return reversed_path
+    path.reverse()
+    return path
+
 
 def LOS(a, b, cache):
     x0, y0, z0 = a
     x1, y1, z1 = b
-    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-    
-    is_descending = y1 < y0
-    
-    if is_descending:
-        steps = max(abs(dx), abs(dy), abs(dz))
-    else:
-        steps = max(abs(dx), abs(dy), abs(dz)) * 2
 
+    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+    descending = dy < 0
+
+    steps = max(abs(dx), abs(dy), abs(dz))
     if steps == 0:
         return True
+    if not descending:
+        steps *= 2
 
     for i in range(steps + 1):
         t = i / steps
         cx = x0 + dx * t
-        cy = y0 + dy * t
+        cy = round(y0 + dy * t)
         cz = z0 + dz * t
-        cy_i = round(cy)
 
         seen = set()
         for ox, oz in LOS_BODY_OFFSETS:
             bx = round(cx + ox)
             bz = round(cz + oz)
+
             if (bx, bz) in seen:
                 continue
             seen.add((bx, bz))
-            if not has_clearance_cached(bx, cy_i, bz, cache):
+
+            if not has_clearance_cached(bx, cy, bz, cache):
                 return False
 
-        if not is_descending:
-            if not is_supportive_cached(round(cx), cy_i - 1, round(cz), cache):
-                return False
+        if (not descending and
+                not is_supportive_cached(round(cx), cy - 1, round(cz), cache)):
+            return False
 
     return True
 
 def interpolate_path(path):
     if not path or len(path) < 2:
         return path
-        
-    dense_path = [path[0]]
+
+    dense = [path[0]]
+
     for i in range(1, len(path)):
         x1, y1, z1 = path[i - 1]
         x2, y2, z2 = path[i]
-        
+
         dx = x2 - x1
         dz = z2 - z1
-        
         steps = max(abs(dx), abs(dz))
-        
-        if steps == 0:
-            steps = abs(y2 - y1)
-            if steps == 0:
-                continue
-            step_y = 1 if y2 > y1 else -1
+
+        if steps:
+            sx = dx / steps
+            sz = dz / steps
+
             for j in range(1, steps + 1):
-                dense_path.append((x1, y1 + step_y * j, z1))
-            continue
-            
-        step_x = dx / steps
-        step_z = dz / steps
-        
-        for j in range(1, steps + 1):
-            nx = int(Math.round(x1 + step_x * j))
-            nz = int(Math.round(z1 + step_z * j))
-            
-            ny = y2 if j == steps else y1
-            
-            dense_path.append((nx, ny, nz))
-            
-    return dense_path
+                dense.append((
+                    int(Math.round(x1 + sx * j)),
+                    y2 if j == steps else y1,
+                    int(Math.round(z1 + sz * j))
+                ))
+        else:
+            step_y = 1 if y2 > y1 else -1
+            for y in range(y1 + step_y, y2 + step_y, step_y):
+                dense.append((x1, y, z1))
 
-def smooth_path(path, cache): 
-    if len(path) <= 2: 
-        return path 
-    result = [path[0]] 
-    i = 0 
+    return dense
 
-    while i < len(path) - 1: 
-        j = i + 1 
-        
-        base_dx = path[i+1][0] - path[i][0]
-        base_dy = path[i+1][1] - path[i][1]
-        base_dz = path[i+1][2] - path[i][2]
+def smooth_path(path, cache):
+    if len(path) <= 2:
+        return path
 
-        while j < len(path): 
-            prev_y = path[j - 1][1] 
-            current_y = path[j][1] 
-            
-            cur_dx = path[j][0] - path[j-1][0]
-            cur_dy = path[j][1] - path[j-1][1]
-            cur_dz = path[j][2] - path[j-1][2]
-            
-            if current_y != prev_y: 
-                if base_dy < 0 and cur_dx == base_dx and cur_dz == base_dz:
-                    pass
-                else:
-                    if j == i + 1: 
-                        j += 1 
-                    break 
-            else:
-                if base_dy < 0:
+    result = [path[0]]
+    i = 0
+
+    while i < len(path) - 1:
+        x0, y0, z0 = path[i]
+        dx0 = path[i + 1][0] - x0
+        dy0 = path[i + 1][1] - y0
+        dz0 = path[i + 1][2] - z0
+
+        j = i + 1
+        while j < len(path):
+            cur_dx = path[j][0] - path[j - 1][0]
+            cur_dy = path[j][1] - path[j - 1][1]
+            cur_dz = path[j][2] - path[j - 1][2]
+
+            if cur_dy:
+                if dy0 >= 0 or cur_dx != dx0 or cur_dz != dz0:
+                    if j == i + 1:
+                        j += 1
                     break
-            if not LOS(path[i], path[j], cache): 
-                break 
-            j += 1 
+            elif dy0 < 0:
+                break
 
-        next_index = j - 1 
+            if not LOS(path[i], path[j], cache):
+                break
 
-        if next_index == i: 
-            next_index = i + 1 
+            j += 1
 
-        result.append(path[next_index]) 
-        i = next_index 
-        
+        i = max(i + 1, j - 1)
+        result.append(path[i])
+
     return result
 
-def get_euclid_dist(p1, p2):
-    dx = p1[0] - p2[0]
-    dy = p1[1] - p2[1]
-    dz = p1[2] - p2[2]
-    return Math.sqrt(dx * dx + dy * dy + dz * dz)
-
 def movement_cost(a, b):
-    dist = get_euclid_dist(a, b)
-    dy = abs(b[1] - a[1])
-    return dist + dy * 1.5
+    dx = a[0] - b[0]
+    dy = a[1] - b[1]
+    dz = a[2] - b[2]
+    return Math.sqrt(dx * dx + dy * dy + dz * dz) + abs(b[1] - a[1]) * 1.5
 
-def path_jump(start_pos, direction, goal, cache, limits):
-    dir_id = DIR_TO_ID[direction]
+def path_jump(pos, direction, goal, cache, limits):
+    key = (BlockPos.asLong(*pos), DIR_TO_ID[direction])
 
-    start_key = BlockPos.asLong(start_pos[0], start_pos[1], start_pos[2])
-    cache_key = (start_key, dir_id)
-
-    cached = cache.jump.get(cache_key)
-
-    if cached is not None or cache.jump.containsKey(cache_key):
+    cached = cache.jump.get(key)
+    if cached is not None:
         return cached
 
-    dx, dy, dz = direction
-    limit_min_x, limit_max_x, limit_min_z, limit_max_z = limits
-    is_diagonal = (dx != 0 and dz != 0)
-    current_pos = start_pos
-    intermediate_nodes = []
-    jump_point = None
+    dx, _, dz = direction
+    min_x, max_x, min_z, max_z = limits
+    diagonal = dx and dz
 
     while True:
-        x, y, z = current_pos
+        x, y, z = pos
         nx, nz = x + dx, z + dz
 
-        if not (limit_min_x <= nx <= limit_max_x and
-                limit_min_z <= nz <= limit_max_z):
+        if not (min_x <= nx <= max_x and min_z <= nz <= max_z):
             break
 
-        ny = None
-        if is_walkable(current_pos, (nx, y, nz), cache):
-            ny = y
-        elif is_walkable(current_pos, (nx, y - 1, nz), cache):
-            ny = y - 1
-        elif is_walkable(current_pos, (nx, y + 1, nz), cache):
-            ny = y + 1
-
+        ny = next_y(pos, nx, y, nz, cache)
         if ny is None:
             break
 
-        next_pos = (nx, ny, nz)
+        pos = (nx, ny, nz)
 
-        if next_pos == goal or ny != y:
-            jump_point = next_pos
-            break
+        if (pos == goal or ny != y or
+            (diagonal and (
+                path_jump(pos, (dx,0,0), goal, cache, limits) or
+                path_jump(pos, (0,0,dz), goal, cache, limits))) or
+            (not diagonal and has_forced_neighbor(pos, x, z, dx, dz, cache))):
+            cache.jump.put(key, pos)
+            return pos
 
-        if is_diagonal:
-            if (path_jump(next_pos, (dx, 0, 0), goal, cache, limits) is not None or
-                path_jump(next_pos, (0, 0, dz), goal, cache, limits) is not None):
-                jump_point = next_pos
-                break
-        else:
-            if dx != 0:
-                if ((not is_walkable(next_pos, (x, ny, nz - 1), cache) and
-                     is_walkable(next_pos, (nx, ny, nz - 1), cache)) or
-                    (not is_walkable(next_pos, (x, ny, nz + 1), cache) and
-                     is_walkable(next_pos, (nx, ny, nz + 1), cache))):
-                    jump_point = next_pos
-                    break
-            else:
-                if ((not is_walkable(next_pos, (nx - 1, ny, z), cache) and
-                     is_walkable(next_pos, (nx - 1, ny, nz), cache)) or
-                    (not is_walkable(next_pos, (nx + 1, ny, z), cache) and
-                     is_walkable(next_pos, (nx + 1, ny, nz), cache))):
-                    jump_point = next_pos
-                    break
+    cache.jump.put(key, None)
+    return None
 
-        intermediate_nodes.append(next_pos)
-        current_pos = next_pos
-
-    cache.jump.put(cache_key, jump_point)
-
-    for node in intermediate_nodes:
-        node_key = BlockPos.asLong(node[0], node[1], node[2])
-        cache.jump.put((node_key, dir_id), jump_point)
-
-    return jump_point
-
-def path_find(start, goal, do_smooth=True, limit=10000):
+def path_find(start, goal, do_smooth=True, limit=20000):
     start_time = System.currentTimeMillis()
-    
-    start = (int(Math.floor(start[0])), int(Math.floor(start[1])), int(Math.floor(start[2])))
-    goal  = (int(Math.floor(goal[0])), int(Math.floor(goal[1])), int(Math.floor(goal[2])))
 
-    limit_min_x = min(start[0], goal[0]) - MARGIN
-    limit_max_x = max(start[0], goal[0]) + MARGIN
-    limit_min_z = min(start[2], goal[2]) - MARGIN
-    limit_max_z = max(start[2], goal[2]) + MARGIN
-    limits = (limit_min_x, limit_max_x, limit_min_z, limit_max_z)
+    start = (int(Math.floor(start[0])),int(Math.floor(start[1])),int(Math.floor(start[2])))
+    goal = (int(Math.floor(goal[0])),int(Math.floor(goal[1])),int(Math.floor(goal[2])))
+
+    limits = (min(start[0], goal[0]) - MARGIN,max(start[0], goal[0]) + MARGIN,
+        min(start[2], goal[2]) - MARGIN,max(start[2], goal[2]) + MARGIN,)
 
     cache = PathCache()
     prefetch_chunks(limits, cache)
+
     start_node = Node(start)
-    start_node.G = 0 
     start_node.H = start_node.heuristic(goal)
 
     pq = MinHeap()
-    tie_breaker = 0
-    
-    pq.push(start_node.F(), start_node.H, tie_breaker, start_node)
+    pq.push(start_node.F(), start_node.H, 0, start_node)
 
+    tie = 0
     closed = HashSet()
     node_map = HashMap()
     node_map.put(start, start_node)
@@ -694,61 +542,49 @@ def path_find(start, goal, do_smooth=True, limit=10000):
         if closed.size() > limit:
             echo("path limit reached")
             return None
+
         current = pq.pop()
-        if closed.contains(current.pos): continue
+
+        if closed.contains(current.pos):
+            continue
         if current.G > node_map.get(current.pos).G:
             continue
 
         if current.pos == goal:
-            raw_path = reconstruct_path(current)
-            
-            # dense_path = interpolate_path(raw_path)
-            dense_path = raw_path
-            
+            path = reconstruct_path(current)
             if do_smooth:
-                final_path = smooth_path(dense_path, cache)
-            else:
-                final_path = dense_path
-            
+                path = smooth_path(path, cache)
+
             elapsed = (System.currentTimeMillis() - start_time) / 1000.0
             echo(f"Expanded: {closed.size()}")
-            echo(f"Generated: {tie_breaker}")
+            echo(f"Generated: {tie}")
             echo(f"Pathfinding took {elapsed:.3f}s")
-            return final_path
+            return path
 
         closed.add(current.pos)
 
         parent = current.parent
-        parent_pos = parent.pos if parent else None
-        dirs = current.get_pruned_dirs(parent_pos, cache)
+        for direction in current.get_pruned_dirs(parent.pos if parent else None, cache):
+            jp = path_jump(current.pos, direction, goal, cache, limits)
+            if jp is None or closed.contains(jp):
+                continue
 
-        for direction in dirs:
-            jp_pos = path_jump(current.pos, direction, goal, cache, limits)
-            
-            if jp_pos:
-                if closed.contains(jp_pos):
-                    continue
+            g = current.G + movement_cost(current.pos, jp)
 
-                dx = abs(jp_pos[0] - current.pos[0])
-                dz = abs(jp_pos[2] - current.pos[2])
+            node = node_map.get(jp)
+            if node is None:
+                node = Node(jp, current)
+                node.G = g
+                node.H = node.heuristic(goal)
+                node_map.put(jp, node)
+            elif g + 1e-9 >= node.G:
+                continue
+            else:
+                node.parent = current
+                node.G = g
 
-                step_cost = movement_cost(current.pos, jp_pos)
-                
-                tentative_G = current.G + step_cost
-
-                neighbor = node_map.get(jp_pos)
-                if neighbor is None:
-                    neighbor = Node(jp_pos, current)
-                    neighbor.G = tentative_G
-                    neighbor.H = neighbor.heuristic(goal)
-                    node_map.put(jp_pos, neighbor)
-                    tie_breaker += 1
-                    pq.push(neighbor.F(), neighbor.H, tie_breaker, neighbor)
-                elif tentative_G + 1e-9 < neighbor.G:
-                    neighbor.parent = current
-                    neighbor.G = tentative_G
-                    tie_breaker += 1
-                    pq.push(neighbor.F(), neighbor.H, tie_breaker, neighbor)
+            tie += 1
+            pq.push(node.F(), node.H, tie, node)
 
     echo("path not found")
     return None
@@ -808,12 +644,9 @@ def normalize_angle(angle):
 
 def face_position(px, py, pz):
     player = mc.player
-
     dx = px - player.getX()
     dz = pz - player.getZ()
-
     yaw = -(Math.atan2(dx, dz) * 180 / Math.PI)
-
     player.setYRot(yaw)
 
 def move_forward(enable=True):
@@ -903,10 +736,8 @@ def update_rotation_and_movement(tx, ty, tz, coasting=False):
         / Math.PI
     )
 
-    horizontal_dist = dist
-
     target_pitch = -(
-        Math.atan2(dy, horizontal_dist)
+        Math.atan2(dy, dist)
         * 180.0
         / Math.PI
     )
@@ -1036,9 +867,6 @@ def on_render(e):
     vel = player.getDeltaMovement()
     speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z)
 
-    dist_sq = dx * dx + dz * dz
-    dist = Math.sqrt(dist_sq)
-
     current_y = player.getY()
 
     inertia_ticks = 4.0
@@ -1059,6 +887,7 @@ def on_render(e):
     should_normal_jump = False
 
     dynamic_jump_dist = 1.6 + (speed * 4.0)
+    is_step_up = (ty - player.getY()) > 0.5
 
     if dy > 0.8 and chev_dist < dynamic_jump_dist:
         should_normal_jump = True
@@ -1074,7 +903,6 @@ def on_render(e):
         ndz = nz - tz
         next_path_yaw = -(Math.atan2(ndx, ndz) * 180.0 / Math.PI)
         turn_angle = abs(normalize_angle(next_path_yaw - target_yaw))
-        echo(turn_angle)
 
         if turn_angle > 85.0:
             is_sharp_turn = True
@@ -1084,7 +912,6 @@ def on_render(e):
         player_to_next_sq = pdx * pdx + pdz * pdz
         cdx = nx - tx
         cdz = nz - tz
-        is_step_up = (ty - player.getY()) > 0.5
 
         current_to_next_sq = cdx * cdx + cdz * cdz
 
@@ -1106,8 +933,6 @@ def on_render(e):
         waypoint_threshold = max(waypoint_threshold, 1.4)
     elif is_sharp_turn and not is_final_waypoint:
         waypoint_threshold = 0.4
-
-    is_step_up = (ty - player.getY()) > 0.5
 
     if chev_dist < waypoint_threshold:
         last_waypoint_dist = 999999.0
@@ -1135,10 +960,7 @@ def on_render(e):
         if speed > 0.15 and pred_dist < 0.3:
             coasting = True
 
-    try:
-        update_rotation_and_movement(tx, ty, tz, coasting=coasting)
-    except TypeError:
-        update_rotation_and_movement(tx, ty, tz)
+    update_rotation_and_movement(tx, ty, tz, coasting=coasting)
 
     is_turning = yaw_error > 30.0
 
