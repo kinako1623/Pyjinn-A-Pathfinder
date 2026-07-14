@@ -45,7 +45,7 @@ debug_timer = 0
 path_future = None
 
 FINAL_WAYPOINT_THRESHOLD = 0.5
-NORMAL_WAYPOINT_THRESHOLD = 1.0
+NORMAL_WAYPOINT_THRESHOLD = 1.6
 WAYPOINT_OVERSHOOT_THRESHOLD = 0.3
 
 MAX_VERTICAL_STEP = 1
@@ -98,48 +98,6 @@ DIR_TO_ID = {
     (-1,  0, -1): 22,
     (-1,  1, -1): 23,
 }
-
-fetched = 0
-def prefetch_chunks(limits, cache):
-    global fetched
-
-    min_cx, max_cx = limits[0] // 16, limits[1] // 16
-    min_cz, max_cz = limits[2] // 16, limits[3] // 16
-    chunk_coords = []
-
-    for cx in range(min_cx, max_cx + 1):
-        for cz in range(min_cz, max_cz + 1):
-            chunk_coords.append((cx, cz))
-
-    coords_len = len(chunk_coords)
-    if coords_len <= 4:  return
-    threads = min(
-        coords_len,
-        min(32, JavaRuntime.getRuntime().availableProcessors() + 4)
-    )
-    def make_task(cx, cz): return lambda: level.getChunk(cx, cz)
-    executor = Executors.newFixedThreadPool(threads)
-    futures = []
-
-    try:
-        for cx, cz in chunk_coords:
-            futures.append(executor.submit(make_task(cx, cz)))
-
-        for i in range(coords_len):
-            coord = chunk_coords[i]
-            chunk = futures[i].get()
-
-            try: 
-                if chunk is not None:
-                    fetched += 1
-                    cache.chunks.put(coord, chunk)
-            except:
-                echo(f"Chunk {coord} prefetch skipped")
-
-        echo(f"Chunk prefetched: total {fetched}")
-
-    finally:
-        executor.shutdown()
 
 def get_state_cached(x, y, z, cache):
     key = (x, y, z)
@@ -480,8 +438,21 @@ def movement_cost(a, b):
     dz = a[2] - b[2]
     return Math.sqrt(dx * dx + dy * dy + dz * dz) + abs(b[1] - a[1]) * 1.5
 
+def make_key(x, y, z, limits):
+    min_x, max_x, min_z, max_z = limits
+
+    x -= min_x
+    z -= min_z
+
+    width = max_x - min_x + 1
+    depth = max_z - min_z + 1
+
+    return (y * depth + z) * width + x
+
 def path_jump(pos, direction, goal, cache, limits):
-    key = (BlockPos.asLong(*pos), DIR_TO_ID[direction])
+    dy_sign = -1 if direction[1] < 0 else (1 if direction[1] > 0 else 0)
+    dir_key = (direction[0], dy_sign, direction[2])
+    key = make_key(pos[0], pos[1], pos[2], limits) * 24 + DIR_TO_ID[dir_key]
 
     cached = cache.jump.get(key)
     if cached is not None:
@@ -525,8 +496,6 @@ def path_find(start, goal, do_smooth=True, limit=20000):
         min(start[2], goal[2]) - MARGIN,max(start[2], goal[2]) + MARGIN,)
 
     cache = PathCache()
-    prefetch_chunks(limits, cache)
-
     start_node = Node(start)
     start_node.H = start_node.heuristic(goal)
 
@@ -551,7 +520,7 @@ def path_find(start, goal, do_smooth=True, limit=20000):
             continue
 
         if current.pos == goal:
-            path = reconstruct_path(current)
+            path = interpolate_path(reconstruct_path(current))
             if do_smooth:
                 path = smooth_path(path, cache)
 
@@ -627,6 +596,7 @@ def goto(x, y, z):
             echo(f"Error in pathfinding thread: {e}")
             raise e
             
+    
     path_future = path_find(start, goal)
 
     if listener_id2 is None:
@@ -652,171 +622,135 @@ def face_position(px, py, pz):
 def move_forward(enable=True):
     mc.options.keyUp.setDown(enable)
 
+def move_left(enable=True):
+    mc.options.keyLeft.setDown(enable)
+
+def move_right(enable=True):
+    mc.options.keyRight.setDown(enable)
+
 def jump(enable=True):
     mc.options.keyJump.setDown(enable)
 
 def stop_all():
+    global strafe_state
     options = mc.options
     options.keyUp.setDown(False)
     options.keyJump.setDown(False)
+    options.keyLeft.setDown(False)
+    options.keyRight.setDown(False)
+    strafe_state = 0
 
-def _min_jerk_curve(t):
-    t = max(0.0, min(1.0, t))
-    return 10.0 * t**3 - 15.0 * t**4 + 6.0 * t**5
+MIN_SPEED = 0.01
+MAX_SPEED = 5.0
+PITCH_LIMIT = 50.0
 
-def _ease_out_cubic(t):
-    t = max(0.0, min(1.0, t))
-    return 1.0 - (1.0 - t) ** 3
+YAW_COEFF = 0.55
+PITCH_COEFF = 0.20
+
+ROTATION_MAX_SPEED = 5.0
+PITCH_MAX_SPEED = 1.0
+
+strafe_state = 0
+strafe_cooldown = 0
+
+STRAFE_ENGAGE_DIST = 0.45
+STRAFE_RELEASE_DIST = 0.25
+STRAFE_ENABLE_YAW_ERROR = 35.0
+# -306 79 -325
 
 def _smooth_rotation_speed(delta, is_yaw=True, distance_to_target=None):
     abs_delta = abs(delta)
+    coeff = YAW_COEFF if is_yaw else PITCH_COEFF
+    base_speed = (4.0 / ((1.0 + Math.exp(-0.18 * (abs_delta - 15.0))) ** 0.8))
+    speed = base_speed * coeff
 
-    coeff = 0.4 if is_yaw else 0.12
-
-    proximity_damping = 1.0
     if distance_to_target is not None:
-        if distance_to_target < 1.5:
-            proximity_damping = 0.35
-        elif distance_to_target < 2.5:
-            proximity_damping = 0.55
-        elif distance_to_target < 4.0:
-            proximity_damping = 0.75
+        close_factor = max(0.4, min(1.0, distance_to_target / 3.0))
+        angle_factor = min(abs_delta / 30.0, 1.0)
+        speed *= close_factor + (1.0 - close_factor) * angle_factor
 
-    if abs_delta < 2.0:
-        speed = coeff * (abs_delta ** 1.2) * 0.2
-
-    elif abs_delta < 13.0:
-        norm_angle = abs_delta / 8.0
-        eased = _min_jerk_curve(norm_angle)
-        speed = coeff * eased
-
-    elif abs_delta < 25.0:
-        norm_angle = (abs_delta - 8.0) / 17.0
-        eased = _ease_out_cubic(norm_angle)
-        speed = 0.8 + eased * 2.8
-
-    elif abs_delta < 60.0:
-        norm_angle = (abs_delta - 25.0) / 35.0
-        eased = _ease_out_cubic(norm_angle)
-        speed = 1.0 + eased * 2.0
-
+    if is_yaw:
+        speed = min(ROTATION_MAX_SPEED, speed)
     else:
-        speed = 2.0
+        speed = min(PITCH_MAX_SPEED, speed * 0.5)
 
-    if not is_yaw:
-        speed *= 0.4
-        if speed > 0.6:
-            speed = 0.6
+    speed = max(MIN_SPEED, speed)
+    return speed if delta >= 0 else -speed
 
-    speed *= proximity_damping
+def _lateral_correction(player, ax, az, bx, bz):
 
-    if speed < 0.01:
-        speed = 0.01
-    elif speed > 3.0:
-        speed = 3.0
+    abx = bx - ax
+    abz = bz - az
+    seg_len_sq = abx * abx + abz * abz
 
-    if speed > abs_delta:
-        speed = abs_delta
+    if seg_len_sq < 0.0001:
+        return 0.0, 0
 
-    return speed if delta > 0 else -speed
+    px, pz = player.getX(), player.getZ()
+    apx = px - ax
+    apz = pz - az
 
-def update_rotation_and_movement(tx, ty, tz, coasting=False):
+    cross = abx * apz - abz * apx
+    seg_len = Math.sqrt(seg_len_sq)
+    offset = cross / seg_len
+
+    EPS = 1e-3
+
+    if cross > EPS:
+        direction = 1
+    elif cross < -EPS:
+        direction = -1
+    else:
+        direction = 0
+
+    return abs(offset), direction
+
+def _apply_strafe_correction(offset_abs, direction):
+    global strafe_state, strafe_cooldown
+
+    if strafe_cooldown > 0:
+        strafe_cooldown -= 1
+
+    if strafe_cooldown <= 0:
+        if strafe_state == 0:
+            if offset_abs > STRAFE_ENGAGE_DIST and direction != 0:
+                strafe_state = direction
+                strafe_cooldown = 3
+        else:
+            if offset_abs < STRAFE_RELEASE_DIST:
+                strafe_state = 0
+                strafe_cooldown = 2
+            elif direction != 0 and direction != strafe_state and offset_abs > STRAFE_ENGAGE_DIST:
+                strafe_state = direction
+                strafe_cooldown = 3
+
+    move_left(strafe_state == 1)
+    move_right(strafe_state == -1)
+
+def update_rotation_and_movement(dist, target_yaw, target_pitch, coasting=False):
+
     player = mc.player
 
-    dx = tx - player.getX()
-    dy = ty - player.getY()
-    dz = tz - player.getZ()
-
-    dist_sq = dx * dx + dz * dz
-    dist = Math.sqrt(dist_sq)
-
-    target_yaw = -(
-        Math.atan2(dx, dz)
-        * 180.0
-        / Math.PI
-    )
-
-    target_pitch = -(
-        Math.atan2(dy, dist)
-        * 180.0
-        / Math.PI
-    )
-
     current_yaw = player.getYRot()
-
-    delta_yaw = normalize_angle(
-        target_yaw - current_yaw
-    )
-
-    abs_delta_yaw = abs(delta_yaw)
-
-    yaw_speed = _smooth_rotation_speed(
-        delta_yaw,
-        is_yaw=True,
-        distance_to_target=dist
-    )
-
-    new_yaw = current_yaw + yaw_speed
-
-    if abs_delta_yaw < 0.08 and dist > 2.0:
-        new_yaw = target_yaw
-    elif abs_delta_yaw < 0.04:
-        new_yaw = target_yaw
-
+    yaw_delta = normalize_angle(target_yaw - current_yaw)
+    yaw_speed = _smooth_rotation_speed(yaw_delta,True,dist)
+    new_yaw = (target_yaw if abs(yaw_delta) < 0.08 and dist > 2.0 else current_yaw + yaw_speed )
     current_pitch = player.getXRot()
-
-    delta_pitch = target_pitch - current_pitch
-
-    abs_delta_pitch = abs(delta_pitch)
-
-    pitch_speed = _smooth_rotation_speed(
-        delta_pitch,
-        is_yaw=False,
-        distance_to_target=dist
-    )
-
-    new_pitch = current_pitch + pitch_speed
-
-    if abs_delta_pitch < 0.08 and dist > 2.0:
-        new_pitch = target_pitch
-    elif abs_delta_pitch < 0.04:
-        new_pitch = target_pitch
-
-    if new_pitch > 50:
-        new_pitch = 50
-
-    if new_pitch < -50:
-        new_pitch = -50
+    pitch_delta = target_pitch - current_pitch
+    pitch_speed = _smooth_rotation_speed(pitch_delta,False,dist)
+    new_pitch = max(-PITCH_LIMIT,min(PITCH_LIMIT, (target_pitch if abs(pitch_delta) < 0.08 and dist > 2.0 else current_pitch + pitch_speed )))
 
     player.setYRot(new_yaw)
     player.setYHeadRot(new_yaw)
     player.setXRot(new_pitch)
 
-    yaw_error = abs(
-        normalize_angle(
-            target_yaw - new_yaw
-        )
-    )
-
-    movement_threshold=min(20,max(12,dist*2))
-
-    if yaw_error < movement_threshold:
-        if coasting:
-            move_forward(False)
-        else:
-            move_forward(True)
-    else:
-        move_forward(False)
+    yaw_error = abs(normalize_angle(target_yaw - new_yaw))
+    movement_threshold = max(12.0, min(20.0, dist * 2.0))
+    
+    move_forward(not coasting and yaw_error < movement_threshold)
 
 def on_render(e):
-    global current_path
-    global current_index
-    global listener_id2
-    global move_status
-    global stuck_ticks
-    global jump_cooldown
-    global last_waypoint_dist
-    global debug_timer
+    global current_path, current_index, listener_id2, move_status, stuck_ticks, jump_cooldown, last_waypoint_dist, debug_timer
 
     if move_status == "searching":
         debug_timer += 1
@@ -830,7 +764,7 @@ def on_render(e):
                 current_index = 0
                 move_status = "running"
                 echo("PATH RECEIVED")
-            except Exception as ex:
+            except Exception:
                 move_status = "idle"
         return
 
@@ -856,122 +790,117 @@ def on_render(e):
 
     point = current_path[current_index]
 
-    tx = point[0] + 0.5
-    ty = point[1]
-    tz = point[2] + 0.5
-
+    tx, ty, tz = point[0] + 0.5, point[1], point[2] + 0.5
     dx = tx - player.getX()
     dy = ty - player.getY()
     dz = tz - player.getZ()
 
-    vel = player.getDeltaMovement()
-    speed = Math.sqrt(vel.x * vel.x + vel.z * vel.z)
+    dist_sq = dx * dx + dz * dz
+    dist = Math.sqrt(dist_sq)
+    chev_dist = max(abs(dx), abs(dz))
 
-    current_y = player.getY()
 
-    inertia_ticks = 4.0
-    pred_y = current_y + (vel.y * inertia_ticks)
-    pred_dist = Math.abs(ty - pred_y)
 
     target_yaw = -(Math.atan2(dx, dz) * 180.0 / Math.PI)
-    yaw_error = abs(normalize_angle(target_yaw - player.getYRot()))
+    target_pitch = -(Math.atan2(dy, dist) * 180.0 / Math.PI)
 
+    yaw_error = abs(normalize_angle(target_yaw - player.getYRot()))
+    vel = player.getDeltaMovement()
+    speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z)
+    pred_dist = abs(ty - (player.getY() + (vel.y * 4.0)))
     is_final_waypoint = (current_index >= len(current_path) - 1)
-    
-    chev_dist = max(Math.abs(dx), Math.abs(dz))
+    is_step_up = dy > 0.5
+    jump_cooldown = max(0, jump_cooldown - 1)
     is_sharp_turn = False
 
-    jump_cooldown = max(0, jump_cooldown - 1)
+    if not is_final_waypoint and (current_index + 1 < len(current_path)):
 
-    state_below = level.getBlockState(mutable_pos.set(tx, ty - 1, tz))
-    should_normal_jump = False
-
-    dynamic_jump_dist = 1.6 + (speed * 4.0)
-    is_step_up = (ty - player.getY()) > 0.5
-
-    if dy > 0.8 and chev_dist < dynamic_jump_dist:
-        should_normal_jump = True
-    elif dy > 1.2 and chev_dist < dynamic_jump_dist + 0.8:
-        should_normal_jump = True
-
-    if current_index + 1 < len(current_path):
         next_point = current_path[current_index + 1]
-        nx = next_point[0] + 0.5
-        nz = next_point[2] + 0.5
+        nx, nz = next_point[0] + 0.5, next_point[2] + 0.5
+        next_path_yaw = -(Math.atan2(nx - tx, nz - tz) * 180.0 / Math.PI)
+        turn_limit = 70 + speed * 20
 
-        ndx = nx - tx
-        ndz = nz - tz
-        next_path_yaw = -(Math.atan2(ndx, ndz) * 180.0 / Math.PI)
-        turn_angle = abs(normalize_angle(next_path_yaw - target_yaw))
-
-        if turn_angle > 85.0:
+        if abs(normalize_angle(next_path_yaw - target_yaw)) > turn_limit:
             is_sharp_turn = True
 
-        pdx = nx - player.getX()
-        pdz = nz - player.getZ()
-        player_to_next_sq = pdx * pdx + pdz * pdz
-        cdx = nx - tx
-        cdz = nz - tz
+        player_to_next_sq = (nx - player.getX())**2 + (nz - player.getZ())**2
+        current_to_next_sq = (nx - tx)**2 + (nz - tz)**2
 
-        current_to_next_sq = cdx * cdx + cdz * cdz
-
-        if (player_to_next_sq < current_to_next_sq and not is_final_waypoint and not is_sharp_turn and not is_step_up):
+        if player_to_next_sq < current_to_next_sq and not is_sharp_turn and not is_step_up:
             echo("skipped")
             last_waypoint_dist = 999999.0
             current_index += 1
             return
 
-    waypoint_threshold = (
-        FINAL_WAYPOINT_THRESHOLD
-        if is_final_waypoint
-        else NORMAL_WAYPOINT_THRESHOLD
-    )
+    waypoint_threshold = FINAL_WAYPOINT_THRESHOLD if is_final_waypoint else NORMAL_WAYPOINT_THRESHOLD
 
-    is_airborne = not player.onGround()
+    if not is_final_waypoint:
 
-    if is_airborne and not is_final_waypoint:
-        waypoint_threshold = max(waypoint_threshold, 1.4)
-    elif is_sharp_turn and not is_final_waypoint:
-        waypoint_threshold = 0.4
+        if not player.onGround():
+            waypoint_threshold = max(waypoint_threshold, 1.4)
+        elif is_sharp_turn:
+            waypoint_threshold = 0.4
 
     if chev_dist < waypoint_threshold:
         last_waypoint_dist = 999999.0
         current_index += 1
-        if (is_step_up):
+        if is_step_up:
             jump(True)
         return
 
-    if (not is_final_waypoint and chev_dist > last_waypoint_dist + WAYPOINT_OVERSHOOT_THRESHOLD):
+    if not is_final_waypoint and chev_dist > last_waypoint_dist + WAYPOINT_OVERSHOOT_THRESHOLD:
         current_index += 1
         last_waypoint_dist = 999999.0
         return
-    
-    
+
+    dynamic_jump_dist = 1.2 + (speed * 2.5)
+    should_normal_jump = (dy > 0.8 and chev_dist < dynamic_jump_dist) or (dy > 1.2 and chev_dist < dynamic_jump_dist + 0.8)
+
     if should_normal_jump:
         jump(True)
-        jump_cooldown = 2 
+        jump_cooldown = 2
     else:
         jump(False)
 
     last_waypoint_dist = chev_dist
-
     coasting = False
-    if (jump_cooldown > 0 or is_airborne) and not is_final_waypoint:
+
+    if (jump_cooldown > 0 or not player.onGround()) and not is_final_waypoint:
         if speed > 0.15 and pred_dist < 0.3:
             coasting = True
 
-    update_rotation_and_movement(tx, ty, tz, coasting=coasting)
+    if yaw_error < STRAFE_ENABLE_YAW_ERROR:
 
-    is_turning = yaw_error > 30.0
-
-    if speed != 0 and speed < 0.07:
-        if is_turning:
-            stuck_ticks = 0
+        if current_index == 0:
+            ax = player.getX()
+            az = player.getZ()
         else:
-            stuck_ticks += 1
+            prev = current_path[current_index - 1]
+            ax = prev[0] + 0.5
+            az = prev[2] + 0.5
+
+        offset_abs, strafe_dir = _lateral_correction(
+            player,
+            ax,
+            az,
+            tx,
+            tz
+        )
+
+        _apply_strafe_correction(offset_abs, strafe_dir)
+
+    else:
+        _apply_strafe_correction(0.0, 0)
+
+    update_rotation_and_movement(dist, target_yaw, target_pitch, coasting=coasting)
+
+    if speed != 0 and speed < 0.1:
+        stuck_ticks += 1
     else:
         stuck_ticks = 0
 
-    if stuck_ticks > 10:
-        jump(True) 
+    if stuck_ticks > 12:
+        jump(True)
         jump_cooldown = 1
+
+
