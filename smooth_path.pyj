@@ -16,7 +16,11 @@ GizmoStyle = JavaClass("net.minecraft.gizmos.GizmoStyle")
 
 MutableBlockPos = JavaClass("net.minecraft.core.BlockPos$MutableBlockPos")
 BlockPos = JavaClass("net.minecraft.core.BlockPos")
-
+ClipContext = JavaClass("net.minecraft.world.level.ClipContext")
+ClipContextBlock = JavaClass("net.minecraft.world.level.ClipContext$Block")
+ClipContextFluid = JavaClass("net.minecraft.world.level.ClipContext$Fluid")
+HitResultType = JavaClass("net.minecraft.world.phys.HitResult$Type")
+ 
 Vec3 = JavaClass("net.minecraft.world.phys.Vec3")
 ARGB = JavaClass("net.minecraft.util.ARGB")
 
@@ -51,6 +55,7 @@ WAYPOINT_OVERSHOOT_THRESHOLD = 0.3
 MAX_VERTICAL_STEP = 1
 BODY_RADIUS = 0.4
 LOS_BODY_OFFSETS = ((-BODY_RADIUS, -BODY_RADIUS), (-BODY_RADIUS, BODY_RADIUS), (BODY_RADIUS, -BODY_RADIUS), (BODY_RADIUS, BODY_RADIUS), (0.0, 0.0))
+HEIGHT_OFFSETS = (0.1, 0.6, 1.2, 1.8)
 COST_CARDINAL = 1.0
 COST_DIAGONAL = Math.sqrt(2.0)
 COST_STEP_CARD = Math.sqrt(2.0)
@@ -326,44 +331,6 @@ def reconstruct_path(node):
     path.reverse()
     return path
 
-
-def LOS(a, b, cache):
-    x0, y0, z0 = a
-    x1, y1, z1 = b
-
-    dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-    descending = dy < 0
-
-    steps = max(abs(dx), abs(dy), abs(dz))
-    if steps == 0:
-        return True
-    if not descending:
-        steps *= 2
-
-    for i in range(steps + 1):
-        t = i / steps
-        cx = x0 + dx * t
-        cy = round(y0 + dy * t)
-        cz = z0 + dz * t
-
-        seen = set()
-        for ox, oz in LOS_BODY_OFFSETS:
-            bx = round(cx + ox)
-            bz = round(cz + oz)
-
-            if (bx, bz) in seen:
-                continue
-            seen.add((bx, bz))
-
-            if not has_clearance_cached(bx, cy, bz, cache):
-                return False
-
-        if (not descending and
-                not is_supportive_cached(round(cx), cy - 1, round(cz), cache)):
-            return False
-
-    return True
-
 def interpolate_path(path):
     if not path or len(path) < 2:
         return path
@@ -395,40 +362,101 @@ def interpolate_path(path):
 
     return dense
 
-def smooth_path(path, cache):
-    if len(path) <= 2:
-        return path
+INF = 9999999.9
 
+def _axis_setup(pos, delta):
+    cell = int(Math.floor(pos))
+    if delta > 0: return cell, 1, (cell + 1.0 - pos) / delta, 1.0 / delta
+    if delta < 0: return cell, -1, (pos - cell) / (-delta), 1.0 / (-delta)
+    return cell, 0, INF, INF
+
+def _dda_cells(sx, sy, sz, ex, ey, ez):
+    x, step_x, t_max_x, t_delta_x = _axis_setup(sx, ex - sx)
+    y, step_y, t_max_y, t_delta_y = _axis_setup(sy, ey - sy)
+    z, step_z, t_max_z, t_delta_z = _axis_setup(sz, ez - sz)
+
+    end_cell = (
+        int(Math.floor(ex)),
+        int(Math.floor(ey)),
+        int(Math.floor(ez))
+    )
+
+    while True:
+        yield (x, y, z)
+
+        if (x, y, z) == end_cell:
+            break
+
+        min_t = min(t_max_x, t_max_y, t_max_z)
+
+        if t_max_x == min_t:
+            x += step_x
+            t_max_x += t_delta_x
+
+        if t_max_y == min_t:
+            y += step_y
+            t_max_y += t_delta_y
+
+        if t_max_z == min_t:
+            z += step_z
+            t_max_z += t_delta_z
+
+def _is_step_pre_node(prev_node, curr_node, next_node):
+    return abs(next_node[1] - curr_node[1]) == 1 and max(abs(next_node[0] - curr_node[0]), abs(next_node[2] - curr_node[2])) <= 1
+
+def LOS(a, b, cache):
+    start = (a[0] + 0.5, a[1], a[2] + 0.5)
+    end = (b[0] + 0.5, b[1], b[2] + 0.5)
+    for offset in LOS_BODY_OFFSETS:
+        for oy in HEIGHT_OFFSETS:
+            s_vec = Vec3(start[0] + offset[0], start[1] + oy, start[2] + offset[1])
+            e_vec = Vec3(end[0] + offset[0], end[1] + oy, end[2] + offset[1])
+            res = level.clip(ClipContext(s_vec, e_vec, ClipContextBlock.COLLIDER, ClipContextFluid.NONE, mc.player)).getType()
+            if res != HitResultType.MISS:
+                return False
+
+    end_cell = (int(Math.floor(end[0])), int(Math.floor(end[1])), int(Math.floor(end[2])))
+    drop_relaxed = b[1] < a[1]
+
+    for cell in _dda_cells(start[0], start[1], start[2], end[0], end[1], end[2]):
+        if blocks_body(cell[0], cell[1], cell[2], cache) or blocks_body(cell[0], cell[1] + 1, cell[2], cache):
+            return False
+        if (not drop_relaxed or cell == end_cell) and not is_supportive_cached(cell[0], cell[1] - 1, cell[2], cache):
+            return False
+
+    return True
+
+def _same_direction(a, b, c):
+    return b[0] - a[0] == c[0] - b[0] and b[2] - a[2] == c[2] - b[2]
+
+def smooth_path(path, cache):
+    if len(path) <= 2: return path
     result = [path[0]]
     i = 0
 
     while i < len(path) - 1:
-        x0, y0, z0 = path[i]
-        dx0 = path[i + 1][0] - x0
-        dy0 = path[i + 1][1] - y0
-        dz0 = path[i + 1][2] - z0
-
         j = i + 1
-        while j < len(path):
-            cur_dx = path[j][0] - path[j - 1][0]
-            cur_dy = path[j][1] - path[j - 1][1]
-            cur_dz = path[j][2] - path[j - 1][2]
-
-            if cur_dy:
-                if dy0 >= 0 or cur_dx != dx0 or cur_dz != dz0:
-                    if j == i + 1:
-                        j += 1
-                    break
-            elif dy0 < 0:
-                break
-
-            if not LOS(path[i], path[j], cache):
-                break
-
+        while j < len(path) and LOS(path[i], path[j], cache): 
             j += 1
 
-        i = max(i + 1, j - 1)
-        result.append(path[i])
+        pre_jump_idx = max(i + 1, j - 1)
+        target = pre_jump_idx
+
+        if j < len(path) and _is_step_pre_node(path[i], path[pre_jump_idx], path[j]):
+            if pre_jump_idx > i:
+                if _same_direction(path[pre_jump_idx - 1], path[pre_jump_idx], path[j]):
+                    target = j
+            else:
+                target = j
+
+        while target + 1 < len(path) and \
+              path[target + 1][1] < path[target][1] and \
+              path[target][1] <= path[i][1] and \
+              _same_direction(path[target - 1], path[target], path[target + 1]):
+            target += 1
+
+        result.append(path[target])
+        i = target
 
     return result
 
@@ -902,5 +930,4 @@ def on_render(e):
     if stuck_ticks > 12:
         jump(True)
         jump_cooldown = 1
-
 
